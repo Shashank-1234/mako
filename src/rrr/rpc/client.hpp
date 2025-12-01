@@ -4,15 +4,11 @@
 #include <rusty/cell.hpp>
 
 #include <unordered_map>
-#include <mutex>
-
+#include "base/all.hpp"
 #include "misc/marshal.hpp"
-#include "reactor/epoll_wrapper.h"
 #include "reactor/reactor.h"
+#include "rpc/rdma/rdma_endpoint.h"
 
-// External safety annotations for system functions used in this module
-// @external: {
-//   socket: [unsafe, (int, int, int) -> int]
 //   connect: [unsafe, (int, const struct sockaddr*, socklen_t) -> int]
 //   close: [unsafe, (int) -> int]
 //   setsockopt: [unsafe, (int, int, int, const void*, socklen_t) -> int]
@@ -193,6 +189,11 @@ class Client: public Pollable {
     rusty::UnsafeCell<SpinLock> pending_fu_l_;
     rusty::UnsafeCell<SpinLock> out_l_;
 
+    // RDMA endpoint (optional, nullptr if using TCP)
+    // Runtime configured via MAKO_REPLICATION_TRANSPORT environment variable
+    // mutable for interior mutability in const methods
+    mutable std::unique_ptr<rrr::rdma::RdmaEndpoint> rdma_endpoint_;
+
     // @unsafe - Cancels all pending futures
     // SAFETY: Protected by spinlock
     void invalidate_pending_futures() const;
@@ -283,13 +284,32 @@ public:
     // SAFETY: Idempotent, properly invalidates futures
     void close() const;
 
-    int fd() const {
+    int fd() const override {
+#ifdef RDMA_REPLICATION
+        if (rdma_endpoint_) {
+            return rdma_endpoint_->fd();
+        }
+#endif
         return sock_.get();
     }
 
     // @unsafe - Returns current poll mode based on output buffer
     // SAFETY: Uses RefCell borrow operations
-    int poll_mode() const;
+    int poll_mode() const override {
+#ifdef RDMA_REPLICATION
+        if (rdma_endpoint_) {
+            return rdma_endpoint_->poll_mode();
+        }
+#endif
+        // TCP mode
+        int mode = Pollable::READ;
+        out_l_.get()->lock();
+        if (!out_.borrow()->empty()) {
+            mode |= Pollable::WRITE;
+        }
+        out_l_.get()->unlock();
+        return mode;
+    }
     // @unsafe - Processes incoming data
     // SAFETY: Protected by spinlock for pending futures
     void handle_read();

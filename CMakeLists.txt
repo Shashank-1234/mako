@@ -44,6 +44,16 @@ if(ENABLE_BORROW_CHECKING)
     enable_borrow_checking()
 endif()
 
+# RDMA support (always compiled, configured at runtime via MAKO_REPLICATION_TRANSPORT)
+message(STATUS "RDMA support compiled (runtime control via MAKO_REPLICATION_TRANSPORT=rdma)")
+
+# Find ibverbs library
+find_library(IBVERBS_LIBRARY NAMES ibverbs)
+if(NOT IBVERBS_LIBRARY)
+    message(FATAL_ERROR "libibverbs not found. Install with: sudo apt-get install libibverbs-dev")
+endif()
+message(STATUS "Found libibverbs: ${IBVERBS_LIBRARY}")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
 
@@ -576,6 +586,8 @@ file(GLOB RRR_SRC
     "src/rrr/rpc/*.cpp"
     "src/rrr/rpc/*.hpp"
     "src/rrr/utils/*.h"
+    "src/rrr/rpc/rdma/*.cpp"
+    "src/rrr/rpc/rdma/*.hpp"
     "src/rrr/rrr.h"
     "src/rrr/rrr.hpp"
 )
@@ -620,7 +632,7 @@ target_include_directories(txlog PRIVATE
     ${Python3_INCLUDE_DIRS}
 )
 
-target_compile_options(txlog PRIVATE ${BENCH_CXXFLAGS})
+target_compile_options(txlog PRIVATE ${BENCH_CXXFLAGS} -g)
 target_compile_definitions(txlog PRIVATE CONFIG_H=\"${CONFIG_H}\")
 
 target_link_libraries(txlog
@@ -633,6 +645,7 @@ target_link_libraries(txlog
     pthread
     ${CMAKE_DL_LIBS}
     Python3::Python
+    ${IBVERBS_LIBRARY}
 )
 
 # Set output location to match expected path
@@ -777,6 +790,7 @@ file(GLOB RRR_BENCH_SRC
     "src/rrr/base/*.cpp"
     "src/rrr/misc/*.cpp"
     "src/rrr/rpc/*.cpp"
+    "src/rrr/rpc/rdma/*.cpp"
     "src/rrr/reactor/*.cc"
 )
 
@@ -789,7 +803,7 @@ if(NOT TARGET rrr)
         ${CMAKE_CURRENT_SOURCE_DIR}/third-party/rusty-cpp/include
     )
     target_compile_options(rrr PUBLIC ${BENCH_CXXFLAGS})
-    target_link_libraries(rrr pthread ${Boost_LIBRARIES})
+    target_link_libraries(rrr pthread ${Boost_LIBRARIES} ${IBVERBS_LIBRARY})
 
     # Add borrow checking for RRR library
     if(ENABLE_BORROW_CHECKING)

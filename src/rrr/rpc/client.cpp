@@ -14,6 +14,8 @@
 #include "reactor/coroutine.h"
 #include "client.hpp"
 #include "utils.hpp"
+#include "rdma/rdma_helper.h"
+#include "transport_config.h"
 
 // External safety annotations for atomic operations and STL functions
 // @external: {
@@ -119,6 +121,11 @@ void Client::close() const {
   if (status_.get() == CONNECTED) {
     // const_cast needed: Arc gives const access but remove() needs non-const reference
     poll_thread_worker_->remove(const_cast<Client&>(*this));
+    // Close RDMA endpoint if active
+    if (rdma_endpoint_) {
+      rdma_endpoint_->Close();
+      rdma_endpoint_.reset();
+    }
     ::close(sock_.get());
   }
   status_.set(CLOSED);
@@ -198,6 +205,31 @@ int Client::connect(const char* addr) const {
   verify(set_nonblocking(sock_.get(), true) == 0);
   Log_debug("rrr::Client: connected to %s", addr);
 
+  // RDMA initialization (runtime configured via MAKO_REPLICATION_TRANSPORT)
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
+    // Initialize RDMA endpoint (uses TCP socket for handshake)
+    rdma_endpoint_ = std::make_unique<rrr::rdma::RdmaEndpoint>();
+    if (!rdma_endpoint_->Initialize()) {
+      Log_error("rrr::Client: RDMA initialization failed (MAKO_REPLICATION_TRANSPORT=rdma)");
+      ::close(sock_.get());
+      sock_.set(-1);
+      return ENOTCONN;
+    }
+    
+    // Connect RDMA endpoint (performs handshake over TCP socket)
+    int port_num = std::stoi(port);
+    if (!rdma_endpoint_->ConnectTo(host.c_str(), port_num)) {
+      Log_error("rrr::Client: RDMA connection failed to %s (MAKO_REPLICATION_TRANSPORT=rdma)", addr);
+      ::close(sock_.get());
+      sock_.set(-1);
+      return ENOTCONN;
+    }
+    
+    // Set receive buffer for RDMA completions
+    rdma_endpoint_->SetReceiveBuffer(&*in_.borrow_mut());
+    Log_info("rrr::Client: RDMA endpoint connected to %s", addr);
+  }
+
   status_.set(CONNECTED);
 
   // Use weak_self_ instead of shared_from_this()
@@ -225,6 +257,12 @@ int Client::handle_write() {
     return Pollable::MODE_NO_CHANGE;
   }
 
+  if (rdma_endpoint_) {
+    // RDMA: handle_write() delegates to RDMA endpoint
+    return rdma_endpoint_->handle_write();
+  }
+
+  // TCP: Write to socket
   int result = Pollable::MODE_NO_CHANGE;
   out_l_.get()->lock();
   out_.borrow_mut()->write_to_fd(sock_.get());
@@ -243,15 +281,21 @@ void Client::handle_read() {
     return;
   }
 
-  int bytes_read = in_.borrow_mut()->read_from_fd(sock_.get());
-
-  // Optimization: If no new data was read AND buffer is empty, return early.
-  // CRITICAL BUG FIX: With edge-triggered epoll (EPOLLET), we MUST check if
-  // there's buffered data to process. The old code would return early even when
-  // content_size() > 0, causing futures to hang because buffered packets never
-  // got processed and we'd lose the edge trigger.
-  if (bytes_read == 0 && in_.borrow()->content_size() == 0) {
-    return;
+  if (rdma_endpoint_) {
+    // RDMA: Handle completions (appends to in_ buffer)
+    rdma_endpoint_->handle_read();
+  } else {
+    // TCP: Read from socket
+    int bytes_read = in_.borrow_mut()->read_from_fd(sock_.get());
+    
+    // Optimization: If no new data was read AND buffer is empty, return early.
+    // CRITICAL BUG FIX: With edge-triggered epoll (EPOLLET), we MUST check if
+    // there's buffered data to process. The old code would return early even when
+    // content_size() > 0, causing futures to hang because buffered packets never
+    // got processed and we'd lose the edge trigger.
+    if (bytes_read == 0 && in_.borrow()->content_size() == 0) {
+      return;
+    }
   }
 
   // Process all complete packets in the buffer
@@ -295,18 +339,6 @@ void Client::handle_read() {
       break;
     }
   }
-}
-
-// @unsafe - Determines polling mode based on output buffer
-// SAFETY: Uses RefCell borrow operations
-int Client::poll_mode() const {
-  int mode = Pollable::READ;
-  out_l_.get()->lock();
-  if (!out_.borrow()->empty()) {
-    mode |= Pollable::WRITE;
-  }
-  out_l_.get()->unlock();
-  return mode;
 }
 
 // @unsafe - Starts new RPC request with marshaling
@@ -361,7 +393,29 @@ void Client::end_request() const {
   // NOTE: end_request() is called from user threads, NOT the poll thread.
   // Must use channel-based update_mode() - the direct worker() path is only safe
   // for poll handlers (handle_read/handle_write) running on the poll thread.
-  poll_thread_worker_->update_mode(const_cast<Client&>(*this), Pollable::READ | Pollable::WRITE);
+  
+#ifdef RDMA_REPLICATION
+  if (rdma_endpoint_) {
+    // RDMA: Post send directly (non-blocking)
+    // No need for PollThread - ibv_post_send() returns immediately
+    ssize_t sent = rdma_endpoint_->SendMessage(*out_.borrow_mut());
+    if (sent < 0) {
+      if (errno == EAGAIN) {
+        Log_warn("RDMA send failed: no flow control credits");
+        // TODO: Queue for retry?
+      } else {
+        Log_error("RDMA send failed: %s", strerror(errno));
+      }
+    }
+    // Clear output buffer after posting
+    out_.borrow_mut()->reset();
+  } else {
+#endif
+    // TCP: Request PollThread to enable EPOLLOUT
+    poll_thread_worker_->update_mode(const_cast<Client&>(*this), Pollable::READ | Pollable::WRITE);
+#ifdef RDMA_REPLICATION
+  }
+#endif
 
   out_l_.get()->unlock();
 }

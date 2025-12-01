@@ -12,6 +12,7 @@
 #include "misc/marshal.hpp"
 #include "reactor/epoll_wrapper.h"
 #include "reactor/reactor.h"
+#include "rpc/rdma/rdma_endpoint.h"
 
 // External safety annotations for system functions used in this module
 // @external: {
@@ -165,6 +166,10 @@ class ServerConnection: public Pollable {
     // Used to pass weak reference to async handlers
     WeakServerConnection weak_self_;
 
+    // RDMA endpoint (optional, nullptr if using TCP)
+    // Runtime configured via MAKO_REPLICATION_TRANSPORT environment variable
+    std::unique_ptr<rrr::rdma::RdmaEndpoint> rdma_endpoint_;
+
     // get_shared() is now inherited from Pollable base class
 
     /**
@@ -232,11 +237,26 @@ public:
     }
 
     int fd() const override {
+        if (rdma_endpoint_) {
+            return rdma_endpoint_->fd();
+        }
         return socket_;
     }
 
     // @safe - Returns poll mode based on output buffer
-    int poll_mode() const override;
+    int poll_mode() const override {
+        if (rdma_endpoint_) {
+            return rdma_endpoint_->poll_mode();
+        }
+        // TCP mode
+        int mode = Pollable::READ;
+        out_l_.lock();
+        if (!out_.empty()) {
+            mode |= Pollable::WRITE;
+        }
+        out_l_.unlock();
+        return mode;
+    }
     // @unsafe - Writes buffered data to socket
     // SAFETY: Protected by output spinlock
     // Returns new poll mode, or MODE_NO_CHANGE if no update needed
