@@ -148,10 +148,16 @@ class ServerConnection: public Pollable {
     friend class Server;
     friend class ServerListener;
 
+private:
+    Marshal block_read_in;
+
+protected:
+    // Weak pointer to self, initialized after creation
+    // Used to pass weak reference to async handlers
+    WeakServerConnection weak_self_;
+    // Protected members accessible to derived classes (e.g., RdmaServerConnection)
     Marshal in_, out_;
     mutable SpinLock out_l_;
-
-    Marshal block_read_in;
 
     Server* server_;
     int socket_;
@@ -159,19 +165,18 @@ class ServerConnection: public Pollable {
     rusty::Option<rusty::Box<Marshal::bookmark>> bmark_;
 
     enum {
-        CONNECTED, CLOSED
+        CONNECTED,    // TCP connection established
+        HANDSHAKING,  // RDMA: performing TCP-based handshake
+        ESTABLISHED,  // RDMA: handshake complete, CQ ready
+        CLOSED        // Connection closed
     } status_;
 
-    // Weak pointer to self, initialized after creation
-    // Used to pass weak reference to async handlers
-    WeakServerConnection weak_self_;
-
-    // RDMA endpoint (optional, nullptr if using TCP)
-    // Runtime configured via MAKO_REPLICATION_TRANSPORT environment variable
-    std::unique_ptr<rrr::rdma::RdmaEndpoint> rdma_endpoint_;
+    // Used to suppress multiple "no handler for rpc_id=..." errors
+    static std::unordered_set<i32> rpc_id_missing_s;
+    static SpinLock rpc_id_missing_l_s;
 
     // get_shared() is now inherited from Pollable base class
-
+    // Note: RDMA connections use RdmaServerConnection subclass
     /**
      * Only to be called by:
      * 1: ~Server(), which is called when destroying Server
@@ -179,11 +184,7 @@ class ServerConnection: public Pollable {
      */
     // @unsafe - Closes connection and cleans up
     // SAFETY: Thread-safe with server connection lock
-    void close();
-
-    // used to surpress multiple "no handler for rpc_id=..." errro
-    static std::unordered_set<i32> rpc_id_missing_s;
-    static SpinLock rpc_id_missing_l_s;
+    virtual void close();
 
 public:
 
@@ -216,7 +217,7 @@ public:
 
     // @unsafe - Completes reply packet
     // SAFETY: Protected by output spinlock
-    void end_reply();
+    virtual void end_reply();
 
     // helper function, do some work in background
     int run_async(const std::function<void()>& f);
@@ -236,19 +237,12 @@ public:
         return *this;
     }
 
-    int fd() const override {
-        if (rdma_endpoint_) {
-            return rdma_endpoint_->fd();
-        }
+    virtual int fd() const override {
         return socket_;
     }
 
-    // @safe - Returns poll mode based on output buffer
-    int poll_mode() const override {
-        if (rdma_endpoint_) {
-            return rdma_endpoint_->poll_mode();
-        }
-        // TCP mode
+    // @safe - Returns poll mode based on output buffer (TCP)
+    virtual int poll_mode() const override {
         int mode = Pollable::READ;
         out_l_.lock();
         if (!out_.empty()) {
@@ -260,12 +254,12 @@ public:
     // @unsafe - Writes buffered data to socket
     // SAFETY: Protected by output spinlock
     // Returns new poll mode, or MODE_NO_CHANGE if no update needed
-    int handle_write() override;
+    virtual int handle_write() override;
     // @unsafe - Reads and processes RPC requests
     // SAFETY: Creates coroutines for handlers
-    void handle_read() override;
+    virtual void handle_read() override;
     // @safe - Error handler
-    void handle_error() override;
+    virtual void handle_error() override;
 
     // Comparison operator for std::unordered_set<rusty::Arc<ServerConnection>>
     friend bool operator==(const rusty::Arc<ServerConnection>& lhs, const rusty::Arc<ServerConnection>& rhs) {

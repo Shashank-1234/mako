@@ -1,5 +1,7 @@
 #include "paxos/server.h"
 #include "paxos/commo.h"
+#include "rrr/rpc/transport_config.h"
+#include "rrr/rpc/rdma/rdma_helper.h"
 #include "service.h"
 #include <chrono>
 #include <thread>
@@ -200,6 +202,12 @@ void PaxosWorker::SetupService() {
   }
   uint32_t num_threads = 1;
   thread_pool_g = new base::ThreadPool(num_threads);
+
+  // Initialize RDMA if configured (one-time global initialization)
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
+    rrr::rdma::GlobalRdmaInitializeOrDie();
+    Log_info("PaxosWorker: RDMA replication transport initialized successfully");
+  }
 
   // init rrr::Server
   rpc_server_ = new rrr::Server(svr_poll_thread_worker_.as_ref().unwrap(), thread_pool_g);

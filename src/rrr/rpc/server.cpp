@@ -12,9 +12,10 @@
 
 #include "reactor/coroutine.h"
 #include "server.hpp"
+#include "rdma/rdma_server_connection.h"
+#include "transport_config.h"
 #include "utils.hpp"
 #include "rdma/rdma_helper.h"
-#include "transport_config.h"
 
 // External safety annotations for atomic operations
 // @external: {
@@ -116,25 +117,8 @@ ServerConnection::ServerConnection(Server* server, int socket)
     server_->sconns_ctr_.next(1);
     block_read_in.init_block_read(100000000);
 
-    // RDMA initialization (runtime configured via MAKO_REPLICATION_TRANSPORT)
-    if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
-        // Initialize RDMA endpoint (uses TCP socket for handshake)
-        rdma_endpoint_ = std::make_unique<rrr::rdma::RdmaEndpoint>();
-        if (!rdma_endpoint_->Initialize()) {
-            Log_error("rrr::ServerConnection: RDMA initialization failed (MAKO_REPLICATION_TRANSPORT=rdma)");
-            verify(0); // Fail-fast, no TCP fallback
-        }
-        
-        // Accept RDMA connection (performs handshake over TCP socket)
-        if (!rdma_endpoint_->AcceptFrom(socket_)) {
-            Log_error("rrr::ServerConnection: RDMA accept failed (MAKO_REPLICATION_TRANSPORT=rdma)");
-            verify(0); // Fail-fast, no TCP fallback
-        }
-        
-        // Set receive buffer for RDMA completions
-        rdma_endpoint_->SetReceiveBuffer(&in_);
-        Log_info("rrr::ServerConnection: RDMA endpoint accepted, fd=%d", socket_);
-    }
+    // TCP connection - no RDMA logic here
+    // RDMA connections use RdmaServerConnection subclass
 }
 
 // @safe - Updates connection counter
@@ -181,22 +165,8 @@ void ServerConnection::end_reply() {
     // NOTE: end_reply() is called from handler threads, NOT the poll thread.
     // Must use channel-based update_mode() - always goes through PollThread.
     if (status_ == CONNECTED) {
-        if (rdma_endpoint_) {
-            // RDMA: Post send directly (non-blocking)
-            ssize_t sent = rdma_endpoint_->SendMessage(out_);
-            if (sent < 0) {
-                if (errno == EAGAIN) {
-                    Log_warn("RDMA send failed: no flow control credits");
-                } else {
-                    Log_error("RDMA send failed: %s", strerror(errno));
-                }
-            }
-            // Clear output buffer after posting
-            out_.reset();
-        } else {
-            // TCP: Request PollThread to enable EPOLLOUT
-            server_->poll_thread_worker_.as_ref().unwrap()->update_mode(*this, Pollable::READ | Pollable::WRITE);
-        }
+        // TCP: Request PollThread to enable EPOLLOUT
+        server_->poll_thread_worker_.as_ref().unwrap()->update_mode(*this, Pollable::READ | Pollable::WRITE);
     }
 
     out_l_.unlock();
@@ -215,16 +185,11 @@ void ServerConnection::handle_read() {
     // The old code only processed ONE packet per handle_read() call,
     // causing hangs when multiple requests arrive together.
 
-    if (rdma_endpoint_) {
-        // RDMA: Handle completions (appends to in_ buffer)
-        rdma_endpoint_->handle_read();
-    } else {
-        // TCP: Read from socket
-        in_.read_from_fd(socket_);
-        
-        if (in_.content_size() == 0) {
-            return;
-        }
+    // TCP: Read from socket
+    in_.read_from_fd(socket_);
+
+    if (in_.content_size() == 0) {
+        return;
     }
 
     list<rusty::Box<Request>> complete_requests;
@@ -316,11 +281,6 @@ int ServerConnection::handle_write() {
         return Pollable::MODE_NO_CHANGE;
     }
 
-    if (rdma_endpoint_) {
-        // RDMA: handle_write() delegates to RDMA endpoint
-        return rdma_endpoint_->handle_write();
-    }
-
     // TCP: Write to socket
     int result = Pollable::MODE_NO_CHANGE;
     out_l_.lock();
@@ -341,7 +301,7 @@ void ServerConnection::handle_error() {
 // @unsafe - Closes connection with proper cleanup
 // SAFETY: Thread-safe with server connection lock, idempotent
 void ServerConnection::close() {
-    if (status_ == CONNECTED) {
+    if (status_ != CLOSED) {
         server_->sconns_l_.lock();
 
         // Find our Arc in server's connection set
@@ -360,11 +320,6 @@ void ServerConnection::close() {
             auto& conn = const_cast<ServerConnection&>(*self.unwrap());
             server_->poll_thread_worker_.as_ref().unwrap()->remove(conn);
             status_ = CLOSED;
-            // Close RDMA endpoint if active
-            if (rdma_endpoint_) {
-                rdma_endpoint_->Close();
-                rdma_endpoint_.reset();
-            }
             ::close(socket_);
             Log_debug("server@%s close ServerConnection at fd=%d", server_->addr_.c_str(), socket_);
         }
@@ -543,10 +498,20 @@ void ServerListener::handle_read() {
       Log_debug("server@%s got new client, fd=%d", this->addr_.c_str(), clnt_socket);
       verify(set_nonblocking(clnt_socket, true) == 0);
 
-      auto sconn = rusty::Arc<ServerConnection>::make(server_, clnt_socket);
-      const_cast<ServerConnection&>(*sconn).weak_self_ = sconn;  // Initialize weak to self
+      // Create appropriate connection type based on transport configuration
+      rusty::Arc<ServerConnection> sconn = [&]() {
+        if (GetReplicationTransport() == ReplicationTransport::RDMA) {
+          Log_info("Creating RdmaServerConnection for fd=%d", clnt_socket);
+          // Arc<RdmaServerConnection> automatically upcasts to Arc<ServerConnection>
+          return rusty::Arc<ServerConnection>(rusty::Arc<RdmaServerConnection>::make(server_, clnt_socket));
+        } else {
+          return rusty::Arc<ServerConnection>::make(server_, clnt_socket);
+        }
+      }();
+
+      const_cast<ServerConnection&>(*sconn).weak_self_ = sconn;
       server_->sconns_l_.lock();
-      server_->sconns_.insert(sconn.clone());  // Insert Arc into set
+      server_->sconns_.insert(sconn.clone());
       server_->sconns_l_.unlock();
       server_->poll_thread_worker_.as_ref().unwrap()->add(sconn);
     } else {
