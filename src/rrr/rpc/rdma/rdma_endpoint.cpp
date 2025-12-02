@@ -187,8 +187,23 @@ void RdmaEndpoint::DeallocateResources() {
 }
 
 bool RdmaEndpoint::BringUpQp(uint16_t remote_lid, ibv_gid remote_gid, uint32_t remote_qp_num) {
-    Log_info("Bringing up QP: local_qp=%u, remote_qp=%u, remote_lid=%u", 
-             qp_->qp_num, remote_qp_num, remote_lid);
+    // Log remote GID in readable format
+    char remote_gid_str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &remote_gid, remote_gid_str, sizeof(remote_gid_str));
+    
+    Log_info("========== BringUpQp START ==========");
+    Log_info("Local QP:  %u", qp_->qp_num);
+    Log_info("Remote QP: %u", remote_qp_num);
+    Log_info("Remote LID: %u", remote_lid);
+    Log_info("Remote GID: %s", remote_gid_str);
+    
+    // Log local GID for comparison
+    ibv_gid local_gid;
+    if (ibv_query_gid(GetRdmaContext(), 1, 1, &local_gid) == 0) {
+        char local_gid_str[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &local_gid, local_gid_str, sizeof(local_gid_str));
+        Log_info("Local GID (index 1): %s", local_gid_str);
+    }
     
     // Transition QP: RESET -> INIT
     ibv_qp_attr attr = {};
@@ -205,50 +220,69 @@ bool RdmaEndpoint::BringUpQp(uint16_t remote_lid, ibv_gid remote_gid, uint32_t r
     Log_info("QP transitioned to INIT");
     
     // Transition QP: INIT -> RTR (Ready to Receive)
+    // Match bRPC implementation exactly
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = IBV_MTU_4096;
-    attr.dest_qp_num = remote_qp_num;
-    attr.rq_psn = 0;
-    attr.max_dest_rd_atomic = 1;
-    attr.min_rnr_timer = 12;
-    attr.ah_attr.is_global = 1;
+    attr.path_mtu = IBV_MTU_1024;
     attr.ah_attr.grh.dgid = remote_gid;
-    attr.ah_attr.grh.sgid_index = 0;
-    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.sgid_index = 1;  // GID 1 is ipv4 mapped, hardcoding for now
+    attr.ah_attr.grh.hop_limit = 255;  // MAX_HOP_LIMIT
+    attr.ah_attr.grh.traffic_class = 0;
     attr.ah_attr.dlid = remote_lid;
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.static_rate = 0;
+    attr.ah_attr.is_global = 1;
     attr.ah_attr.port_num = 1;
+    attr.dest_qp_num = remote_qp_num;
+    attr.rq_psn = 0;
+    attr.max_dest_rd_atomic = 0;  // bRPC uses 0, not 1
+    attr.min_rnr_timer = 0;  // bRPC uses 0 (no RNR tolerance)
     
-    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER | 
+            IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    
+    Log_info("--- RTR Transition Parameters ---");
+    Log_info("  path_mtu: %d (1024)", attr.path_mtu);
+    Log_info("  dest_qp_num: %u", attr.dest_qp_num);
+    Log_info("  rq_psn: %u", attr.rq_psn);
+    Log_info("  max_dest_rd_atomic: %u", attr.max_dest_rd_atomic);
+    Log_info("  min_rnr_timer: %u", attr.min_rnr_timer);
+    Log_info("  ah_attr.is_global: %d", attr.ah_attr.is_global);
+    Log_info("  ah_attr.dlid: %u", attr.ah_attr.dlid);
+    Log_info("  ah_attr.port_num: %u", attr.ah_attr.port_num);
+    Log_info("  ah_attr.grh.sgid_index: %u", attr.ah_attr.grh.sgid_index);
+    Log_info("  ah_attr.grh.hop_limit: %u", attr.ah_attr.grh.hop_limit);
+    Log_info("  ah_attr.grh.dgid: %s", remote_gid_str);
     
     if (ibv_modify_qp(qp_, &attr, flags) != 0) {
-        Log_error("Failed to transition QP to RTR: %s", strerror(errno));
+        Log_error("Failed to transition QP to RTR: %s (errno=%d)", strerror(errno), errno);
         return false;
     }
-    Log_info("QP transitioned to RTR (Ready to Receive)");
+    Log_info("✓ QP transitioned to RTR (Ready to Receive)");
     
     // Transition QP: RTR -> RTS (Ready to Send)
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
-    attr.sq_psn = 0;
     attr.timeout = 14;
     attr.retry_cnt = 7;
-    attr.rnr_retry = 0;  // Zero RNR tolerance (fail-fast)
-    attr.max_rd_atomic = 1;
+    attr.rnr_retry = 0;  // bRPC: no RNR tolerance
+    attr.sq_psn = 0;
+    attr.max_rd_atomic = 0;  // bRPC uses 0, not 1
     
-    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | 
-            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+    flags = IBV_QP_STATE | IBV_QP_RNR_RETRY | IBV_QP_RETRY_CNT | 
+            IBV_QP_TIMEOUT | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     
     if (ibv_modify_qp(qp_, &attr, flags) != 0) {
-        Log_error("Failed to transition QP to RTS: %s", strerror(errno));
+        Log_error("Failed to transition QP to RTS: %s (errno=%d)", strerror(errno), errno);
         return false;
     }
-    Log_info("QP transitioned to RTS (Ready to Send)");
+    Log_info("✓ QP transitioned to RTS (Ready to Send)");
     
-    Log_info("QP fully established: local_qp=%u, remote_qp=%u", qp_->qp_num, remote_qp_num);
+    Log_info("========== QP FULLY ESTABLISHED ==========");
+    Log_info("Local QP %u <-> Remote QP %u", qp_->qp_num, remote_qp_num);
+    Log_info("Local GID: (query above) -> Remote GID: %s", remote_gid_str);
     return true;
 }
 

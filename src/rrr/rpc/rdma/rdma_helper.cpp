@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <vector>
 #include <mutex>
+#include <arpa/inet.h>
 
 namespace rrr {
 namespace rdma {
@@ -232,11 +233,17 @@ bool GetRdmaDeviceInfo(RdmaDeviceInfo* info) {
     
     info->lid = port_attr.lid;
     
-    // Get GID
-    if (ibv_query_gid(g_context, 1, 0, &info->gid) != 0) {
-        Log_error("Failed to query GID: %s", strerror(errno));
+    // Get GID - use index 1 for IPv4-mapped GID (::ffff:x.x.x.x)
+    // GID index 0 is link-local (fe80::...), index 1 is IPv4-mapped
+    if (ibv_query_gid(g_context, 1, 1, &info->gid) != 0) {
+        Log_error("Failed to query GID index 1: %s", strerror(errno));
         return false;
     }
+    
+    // Debug: log the GID we're using
+    char gid_str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &info->gid, gid_str, sizeof(gid_str));
+    Log_info("Using GID index 1: %s", gid_str);
     
     // Query device attributes
     ibv_device_attr dev_attr;
