@@ -121,21 +121,23 @@ void Client::close() const {
   if (status_.get() == CONNECTED) {
     // const_cast needed: Arc gives const access but remove() needs non-const reference
     poll_thread_worker_->remove(const_cast<Client&>(*this));
+    
     // Close RDMA endpoint if active
-    if (rdma_endpoint_) {
+    if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
       rdma_endpoint_->Close();
       rdma_endpoint_.reset();
     }
+    
+    // Close the socket
     ::close(sock_.get());
   }
   status_.set(CLOSED);
   invalidate_pending_futures();
 }
 
-// @unsafe - Establishes TCP/IPC connection to server
+// @unsafe - Establishes TCP connection to server
 // SAFETY: Proper socket creation, configuration, and error handling
-int Client::connect(const char* addr) const {
-  verify(status_.get() != CONNECTED);
+int Client::TcpConnect(const char* addr) const {
   string addr_str(addr);
   size_t idx = addr_str.find(":");
   if (idx == string::npos) {
@@ -203,33 +205,9 @@ int Client::connect(const char* addr) const {
   }
 #endif
   verify(set_nonblocking(sock_.get(), true) == 0);
-  Log_debug("rrr::Client: connected to %s", addr);
+  Log_debug("rrr::Client: TCP connected to %s", addr);
 
-  // RDMA initialization (runtime configured via MAKO_REPLICATION_TRANSPORT)
-  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
-    // Initialize RDMA endpoint (uses TCP socket for handshake)
-    rdma_endpoint_ = std::make_unique<rrr::rdma::RdmaEndpoint>();
-    if (!rdma_endpoint_->Initialize()) {
-      Log_error("rrr::Client: RDMA initialization failed (MAKO_REPLICATION_TRANSPORT=rdma)");
-      ::close(sock_.get());
-      sock_.set(-1);
-      return ENOTCONN;
-    }
-    
-    // Connect RDMA endpoint (performs handshake over TCP socket)
-    int port_num = std::stoi(port);
-    if (!rdma_endpoint_->ConnectTo(host.c_str(), port_num)) {
-      Log_error("rrr::Client: RDMA connection failed to %s (MAKO_REPLICATION_TRANSPORT=rdma)", addr);
-      ::close(sock_.get());
-      sock_.set(-1);
-      return ENOTCONN;
-    }
-    
-    // Set receive buffer for RDMA completions
-    rdma_endpoint_->SetReceiveBuffer(&*in_.borrow_mut());
-    Log_info("rrr::Client: RDMA endpoint connected to %s", addr);
-  }
-
+  // TCP connection: set status and add to poll thread
   status_.set(CONNECTED);
 
   // Use weak_self_ instead of shared_from_this()
@@ -242,6 +220,70 @@ int Client::connect(const char* addr) const {
   }
 
   return 0;
+}
+
+// @unsafe - Establishes RDMA connection with async handshake
+// SAFETY: Proper socket creation, RDMA initialization, and async handshake setup
+int Client::RdmaConnect(const char* addr) const {
+  string addr_str(addr);
+  size_t idx = addr_str.find(":");
+  if (idx == string::npos) {
+    Log_error("rrr::Client: bad connect address: %s", addr);
+    return EINVAL;
+  }
+  string host = addr_str.substr(0, idx);
+  string port = addr_str.substr(idx + 1);
+
+  Log_info("rrr::Client: Starting RDMA connection to %s", addr);
+
+  // Initialize RDMA endpoint
+  rdma_endpoint_ = std::make_unique<rrr::rdma::RdmaEndpoint>();
+  if (!rdma_endpoint_->Initialize()) {
+    Log_error("rrr::Client: RDMA initialization failed");
+    rdma_endpoint_.reset();
+    return ENOTCONN;
+  }
+
+  // Set receive buffer for RDMA completions
+  rdma_endpoint_->SetReceiveBuffer(&*in_.borrow_mut());
+
+  // Perform RDMA handshake synchronously over TCP socket
+  if (!rdma_endpoint_->ConnectTo(host.c_str(), std::stoi(port))) {
+    Log_error("rrr::Client: RDMA handshake failed");
+    rdma_endpoint_.reset();
+    return ENOTCONN;
+  }
+
+  Log_info("rrr::Client: RDMA handshake complete, connected to %s", addr);
+
+  // Set status to CONNECTED
+  status_.set(CONNECTED);
+
+  // Add to poll thread - will monitor RDMA completion channel
+  auto self = weak_self_.borrow()->upgrade();
+  if (self.is_some()) {
+    poll_thread_worker_->add(self.unwrap());
+  } else {
+    Log_error("rrr::Client: weak_self_ upgrade failed - client may not have been created with factory method");
+    rdma_endpoint_.reset();
+    return EINVAL;
+  }
+
+  Log_info("rrr::Client: Now polling RDMA completion channel fd=%d", fd());
+  return 0;
+}
+
+// @unsafe - Establishes connection to server (dispatches to TCP or RDMA)
+// SAFETY: Proper transport selection and delegation
+int Client::connect(const char* addr) const {
+  verify(status_.get() != CONNECTED);
+  
+  // Check transport type and dispatch to appropriate connect function
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
+    return RdmaConnect(addr);
+  } else {
+    return TcpConnect(addr);
+  }
 }
 
 // @safe - Simple error handler
@@ -257,7 +299,7 @@ int Client::handle_write() {
     return Pollable::MODE_NO_CHANGE;
   }
 
-  if (rdma_endpoint_) {
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: handle_write() delegates to RDMA endpoint
     return rdma_endpoint_->handle_write();
   }
@@ -281,7 +323,7 @@ void Client::handle_read() {
     return;
   }
 
-  if (rdma_endpoint_) {
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: Handle completions (appends to in_ buffer)
     rdma_endpoint_->handle_read();
   } else {
@@ -394,8 +436,7 @@ void Client::end_request() const {
   // Must use channel-based update_mode() - the direct worker() path is only safe
   // for poll handlers (handle_read/handle_write) running on the poll thread.
   
-#ifdef RDMA_REPLICATION
-  if (rdma_endpoint_) {
+  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: Post send directly (non-blocking)
     // No need for PollThread - ibv_post_send() returns immediately
     ssize_t sent = rdma_endpoint_->SendMessage(*out_.borrow_mut());
@@ -410,12 +451,9 @@ void Client::end_request() const {
     // Clear output buffer after posting
     out_.borrow_mut()->reset();
   } else {
-#endif
     // TCP: Request PollThread to enable EPOLLOUT
     poll_thread_worker_->update_mode(const_cast<Client&>(*this), Pollable::READ | Pollable::WRITE);
-#ifdef RDMA_REPLICATION
   }
-#endif
 
   out_l_.get()->unlock();
 }

@@ -8,6 +8,7 @@
 #include "misc/marshal.hpp"
 #include "reactor/reactor.h"
 #include "rpc/rdma/rdma_endpoint.h"
+#include "rpc/transport_config.h"
 
 //   connect: [unsafe, (int, const struct sockaddr*, socklen_t) -> int]
 //   close: [unsafe, (int) -> int]
@@ -197,6 +198,13 @@ class Client: public Pollable {
     // @unsafe - Cancels all pending futures
     // SAFETY: Protected by spinlock
     void invalidate_pending_futures() const;
+    
+    // Helper functions for connect()
+    // @unsafe - Establishes TCP connection
+    int TcpConnect(const char* addr) const;
+    
+    // @unsafe - Establishes RDMA connection with async handshake
+    int RdmaConnect(const char* addr) const;
 
 public:
 
@@ -285,22 +293,20 @@ public:
     void close() const;
 
     int fd() const override {
-#ifdef RDMA_REPLICATION
-        if (rdma_endpoint_) {
+        if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+            // RDMA: poll the completion channel
             return rdma_endpoint_->fd();
         }
-#endif
         return sock_.get();
     }
 
     // @unsafe - Returns current poll mode based on output buffer
     // SAFETY: Uses RefCell borrow operations
     int poll_mode() const override {
-#ifdef RDMA_REPLICATION
-        if (rdma_endpoint_) {
+        if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+            // RDMA: only needs READ for completion events
             return rdma_endpoint_->poll_mode();
         }
-#endif
         // TCP mode
         int mode = Pollable::READ;
         out_l_.get()->lock();
