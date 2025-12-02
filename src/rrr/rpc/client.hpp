@@ -190,8 +190,12 @@ class Client: public Pollable {
     rusty::UnsafeCell<SpinLock> pending_fu_l_;
     rusty::UnsafeCell<SpinLock> out_l_;
 
+    // Transport type for this specific connection
+    // Determined during connect() based on whether target is local or remote
+    mutable ReplicationTransport transport_;
+
     // RDMA endpoint (optional, nullptr if using TCP)
-    // Runtime configured via MAKO_REPLICATION_TRANSPORT environment variable
+    // Created if transport_ == RDMA
     // mutable for interior mutability in const methods
     mutable std::unique_ptr<rrr::rdma::RdmaEndpoint> rdma_endpoint_;
 
@@ -226,7 +230,8 @@ public:
         xid_counter_(),     // Default-constructs RefCell<Counter>
         pending_fu_(),      // Default-constructs RefCell<map>
         pending_fu_l_(),    // Default-constructs mutable SpinLock
-        out_l_() { }        // Default-constructs mutable SpinLock
+        out_l_(),           // Default-constructs mutable SpinLock
+        transport_(ReplicationTransport::TCP) { }  // Default to TCP, set during connect()
 
     // Factory method to create Client with Arc
     // @unsafe - Returns Arc<Client> with explicit reference counting
@@ -293,7 +298,7 @@ public:
     void close() const;
 
     int fd() const override {
-        if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+        if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
             // RDMA: poll the completion channel
             return rdma_endpoint_->fd();
         }
@@ -303,7 +308,7 @@ public:
     // @unsafe - Returns current poll mode based on output buffer
     // SAFETY: Uses RefCell borrow operations
     int poll_mode() const override {
-        if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+        if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
             // RDMA: only needs READ for completion events
             return rdma_endpoint_->poll_mode();
         }

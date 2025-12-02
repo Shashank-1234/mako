@@ -453,7 +453,7 @@ void Server::server_loop(struct addrinfo* svr_addr) {
 
 #ifdef USE_IPC
       struct sockaddr_un fsaun;
-        uint32_t from_len;
+      uint32_t from_len;
       int clnt_socket = ::accept(server_sock_, (struct sockaddr*)&fsaun, &from_len);
 #else
       int clnt_socket = accept(server_sock_, svr_addr->ai_addr, &svr_addr->ai_addrlen);
@@ -489,22 +489,46 @@ void ServerListener::handle_read() {
   while (true) {
 #ifdef USE_IPC
     struct sockaddr_un fsaun;
-      uint32_t from_len;
+    uint32_t from_len;
     int clnt_socket = ::accept(server_sock_, (struct sockaddr*)&fsaun, &from_len);
 #else
-    int clnt_socket = ::accept(server_sock_, p_svr_addr_->ai_addr, &p_svr_addr_->ai_addrlen);
+    struct sockaddr_storage client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    int clnt_socket = ::accept(server_sock_, (struct sockaddr*)&client_addr, &client_addr_len);
+
+    char client_ip_buf[INET6_ADDRSTRLEN];
+    const char* client_ip = "unknown";
+    bool is_local = false;
+
+    if (clnt_socket >= 0) {
+      if (client_addr.ss_family == AF_INET) {
+        struct sockaddr_in* addr_in = (struct sockaddr_in*)&client_addr;
+        inet_ntop(AF_INET, &(addr_in->sin_addr), client_ip_buf, sizeof(client_ip_buf));
+        client_ip = client_ip_buf;
+      } else if (client_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6* addr_in6 = (struct sockaddr_in6*)&client_addr;
+        inet_ntop(AF_INET6, &(addr_in6->sin6_addr), client_ip_buf, sizeof(client_ip_buf));
+        client_ip = client_ip_buf;
+      }
+      is_local = IsLocalIP(client_ip);
+    }
 #endif
     if (clnt_socket >= 0) {
-      Log_debug("server@%s got new client, fd=%d", this->addr_.c_str(), clnt_socket);
+      Log_debug("server@%s got new client from %s, fd=%d", this->addr_.c_str(), client_ip, clnt_socket);
       verify(set_nonblocking(clnt_socket, true) == 0);
 
-      // Create appropriate connection type based on transport configuration
+      // Create appropriate connection type:
+      // - Local connections (same machine): use TCP (ServerConnection)
+      // - Remote connections: use configured transport (RDMA if enabled)
       rusty::Arc<ServerConnection> sconn = [&]() {
-        if (GetReplicationTransport() == ReplicationTransport::RDMA) {
-          Log_info("Creating RdmaServerConnection for fd=%d", clnt_socket);
-          // Arc<RdmaServerConnection> automatically upcasts to Arc<ServerConnection>
+        auto transport = GetReplicationTransport();
+        if (!is_local && transport == ReplicationTransport::RDMA) {
+          Log_info("Creating RdmaServerConnection for remote client %s (fd=%d)", client_ip, clnt_socket);
           return rusty::Arc<ServerConnection>(rusty::Arc<RdmaServerConnection>::make(server_, clnt_socket));
         } else {
+          if (is_local && transport == ReplicationTransport::RDMA) {
+            Log_info("Creating ServerConnection for local client %s (fd=%d) - using TCP for local", client_ip, clnt_socket);
+          }
           return rusty::Arc<ServerConnection>::make(server_, clnt_socket);
         }
       }();

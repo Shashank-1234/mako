@@ -123,7 +123,7 @@ void Client::close() const {
     poll_thread_worker_->remove(const_cast<Client&>(*this));
     
     // Close RDMA endpoint if active
-    if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+    if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
       rdma_endpoint_->Close();
       rdma_endpoint_.reset();
     }
@@ -278,11 +278,31 @@ int Client::RdmaConnect(const char* addr) const {
 int Client::connect(const char* addr) const {
   verify(status_.get() != CONNECTED);
   
-  // Check transport type and dispatch to appropriate connect function
-  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA) {
-    return RdmaConnect(addr);
-  } else {
+  // Parse server IP from address string (format: "host:port")
+  string addr_str(addr);
+  size_t idx = addr_str.find(":");
+  if (idx == string::npos) {
+    Log_error("rrr::Client: bad connect address: %s", addr);
+    return EINVAL;
+  }
+  string host = addr_str.substr(0, idx);
+
+  // Determine transport based on whether target is local or remote
+  bool is_local = rrr::IsLocalIP(host.c_str());
+  auto configured_transport = rrr::GetReplicationTransport();
+
+  if (is_local || configured_transport == rrr::ReplicationTransport::TCP) {
+    // Use TCP for local connections or if TCP is configured
+    transport_ = rrr::ReplicationTransport::TCP;
+    if (is_local && configured_transport == rrr::ReplicationTransport::RDMA) {
+      Log_info("rrr::Client: Using TCP for local connection to %s (RDMA configured but local)", host.c_str());
+    }
     return TcpConnect(addr);
+  } else {
+    // Use RDMA for remote connections when RDMA is configured
+    transport_ = rrr::ReplicationTransport::RDMA;
+    Log_info("rrr::Client: Using RDMA for remote connection to %s", host.c_str());
+    return RdmaConnect(addr);
   }
 }
 
@@ -299,7 +319,7 @@ int Client::handle_write() {
     return Pollable::MODE_NO_CHANGE;
   }
 
-  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+  if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: handle_write() delegates to RDMA endpoint
     return rdma_endpoint_->handle_write();
   }
@@ -323,7 +343,7 @@ void Client::handle_read() {
     return;
   }
 
-  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+  if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: Handle completions (appends to in_ buffer)
     rdma_endpoint_->handle_read();
   } else {
@@ -436,7 +456,7 @@ void Client::end_request() const {
   // Must use channel-based update_mode() - the direct worker() path is only safe
   // for poll handlers (handle_read/handle_write) running on the poll thread.
   
-  if (rrr::GetReplicationTransport() == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
+  if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
     // RDMA: Post send directly (non-blocking)
     // No need for PollThread - ibv_post_send() returns immediately
     ssize_t sent = rdma_endpoint_->SendMessage(*out_.borrow_mut());
