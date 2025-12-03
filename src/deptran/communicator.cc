@@ -7,23 +7,12 @@
 #include "command_marshaler.h"
 #include "procedure.h"
 #include "rcc_rpc.h"
-#include "rrr/rpc/rdma/rdma_helper.h"
-#include "rrr/rpc/transport_config.h"
 
 namespace janus {
 
 Communicator::Communicator(rusty::Option<rusty::Arc<PollThread>> poll_thread_worker) {
   Log_info("setup paxos communicator");
 
-  auto transport = rrr::GetReplicationTransport();
-  Log_info("Transport type %s used", rrr::ReplicationTransportToString(transport));
-
-  // Initialize RDMA if configured (one-time global initialization)
-  if (transport == rrr::ReplicationTransport::RDMA) {
-    Log_info("Initializing RDMA replication transport...");
-    rrr::rdma::GlobalRdmaInitializeOrDie();
-    Log_info("RDMA replication transport initialized successfully");
-  }
 
   vector<string> addrs;
   if (poll_thread_worker.is_none())

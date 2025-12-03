@@ -331,6 +331,12 @@ void ServerConnection::close() {
 Server::Server(rusty::Option<rusty::Arc<PollThread>> poll_thread_worker /* =... */, ThreadPool* thrpool /* =? */)
         : server_sock_(-1), status_(NEW) {
 
+    // Initialize RDMA if configured (one-time global initialization)
+    if (GetReplicationTransport() == ReplicationTransport::RDMA) {
+        rrr::rdma::GlobalRdmaInitializeOrDie();
+        Log_info("Server: RDMA replication transport initialized");
+    }
+
     // get rid of eclipse warning
     memset(&loop_th_, 0, sizeof(loop_th_));
 

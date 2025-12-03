@@ -8,6 +8,7 @@
 #include "misc/marshal.hpp"
 #include "reactor/reactor.h"
 #include "rpc/rdma/rdma_endpoint.h"
+#include "rpc/rdma/rdma_helper.h"
 #include "rpc/transport_config.h"
 
 //   connect: [unsafe, (int, const struct sockaddr*, socklen_t) -> int]
@@ -231,7 +232,14 @@ public:
         pending_fu_(),      // Default-constructs RefCell<map>
         pending_fu_l_(),    // Default-constructs mutable SpinLock
         out_l_(),           // Default-constructs mutable SpinLock
-        transport_(ReplicationTransport::TCP) { }  // Default to TCP, set during connect()
+        transport_(ReplicationTransport::TCP) {  // Default to TCP, set during connect()
+
+            // Initialize RDMA if configured (one-time global initialization)
+        if (GetReplicationTransport() == ReplicationTransport::RDMA) {
+            rrr::rdma::GlobalRdmaInitializeOrDie();
+            Log_info("Client: RDMA replication transport initialized");
+        }
+    }
 
     // Factory method to create Client with Arc
     // @unsafe - Returns Arc<Client> with explicit reference counting
