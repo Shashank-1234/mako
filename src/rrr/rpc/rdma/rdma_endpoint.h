@@ -48,7 +48,7 @@ public:
     int handle_write() override;
     
     // Handle connection errors
-    void handle_error() override;
+    void handle_error(uint32_t events) override;
     
     // === RDMA-specific API ===
     // Send message directly (called from user thread in end_request)

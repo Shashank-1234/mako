@@ -664,8 +664,13 @@ int RdmaEndpoint::handle_write() {
     return Pollable::MODE_NO_CHANGE;
 }
 
-void RdmaEndpoint::handle_error() {
-    Log_error("RdmaEndpoint: error on completion channel");
+void RdmaEndpoint::handle_error(uint32_t events) {
+    // Ignore spurious EPOLLRDHUP on completion channel
+    if ((events & EPOLLRDHUP) && !(events & (EPOLLERR | EPOLLHUP))) {
+        Log_debug("RdmaEndpoint: ignoring EPOLLRDHUP on completion channel");
+        return;
+    }
+    Log_error("RdmaEndpoint: error on completion channel, events=0x%x", events);
     Close();
 }
 

@@ -111,7 +111,7 @@ class ServerListener: public Pollable {
   void handle_read() override;
 
   // @safe - Not implemented, will abort if called
-  void handle_error() override {verify(0);}
+  void handle_error(uint32_t events) override {(void)events; verify(0);}
 
   // @safe - Closes server socket
   // Close is marked safe via external annotation
@@ -259,7 +259,7 @@ public:
     // SAFETY: Creates coroutines for handlers
     virtual void handle_read() override;
     // @safe - Error handler
-    virtual void handle_error() override;
+    virtual void handle_error(uint32_t events) override;
 
     // Comparison operator for std::unordered_set<rusty::Arc<ServerConnection>>
     friend bool operator==(const rusty::Arc<ServerConnection>& lhs, const rusty::Arc<ServerConnection>& rhs) {

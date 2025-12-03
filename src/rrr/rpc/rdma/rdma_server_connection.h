@@ -30,6 +30,9 @@ public:
     
     // Override to cleanup RDMA resources
     void close() override;
+    
+    // Override to ignore spurious EPOLLRDHUP on RDMA completion channel
+    void handle_error(uint32_t events) override;
 
 private:
     std::unique_ptr<rdma::RdmaEndpoint> rdma_endpoint_;

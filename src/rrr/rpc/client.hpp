@@ -337,7 +337,7 @@ public:
     // Returns new poll mode, or MODE_NO_CHANGE if no update needed
     int handle_write() override;
     // @unsafe - Error handler that closes connection
-    void handle_error();
+    void handle_error(uint32_t events) override;
 
 };
 

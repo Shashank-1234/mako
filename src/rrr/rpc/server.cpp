@@ -294,7 +294,8 @@ int ServerConnection::handle_write() {
 }
 
 // @safe - Simple error handler
-void ServerConnection::handle_error() {
+void ServerConnection::handle_error(uint32_t events) {
+    (void)events;  // TCP connections close on any error
     this->close();
 }
 

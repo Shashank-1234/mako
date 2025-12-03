@@ -50,7 +50,8 @@ public:
     // PollThreadWorker will call update_mode() based on return value
     virtual int handle_write() = 0;
     // @unsafe - Handles error events (implementation-specific)
-    virtual void handle_error() = 0;
+    // events: the epoll event mask (EPOLLERR, EPOLLHUP, EPOLLRDHUP)
+    virtual void handle_error(uint32_t events) = 0;
 };
 
 
@@ -297,7 +298,7 @@ class Epoll {
       }
       // handle error after handle IO, so that we can at least process something
       if (evlist[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-          poll->handle_error();
+          poll->handle_error(evlist[i].events);
       }
     }
 #endif

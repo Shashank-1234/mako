@@ -1,5 +1,6 @@
 #include "rdma_server_connection.h"
 #include "../../base/all.hpp"
+#include <execinfo.h>
 
 namespace rrr {
 
@@ -67,7 +68,7 @@ void RdmaServerConnection::handle_read() {
         // Perform RDMA handshake over TCP socket (blocking call)
         if (!rdma_endpoint_->AcceptFrom(ctrl_socket_)) {
             Log_error("RdmaServerConnection: RDMA handshake failed");
-            handle_error();
+            close();
             return;
         }
 
@@ -86,7 +87,10 @@ void RdmaServerConnection::handle_read() {
         // Add back with new FD (completion channel)
         auto self_arc = weak_self_.upgrade();
         if (self_arc.is_some()) {
+            Log_info("RdmaServerConnection: Adding to poll with new FD, self_arc strong_count=%zu", 
+                     self_arc.as_ref().unwrap().strong_count());
             server_->poll_thread_worker_.as_ref().unwrap()->add(self_arc.unwrap());
+            Log_info("RdmaServerConnection: After add()");
         } else {
             Log_error("RdmaServerConnection: Failed to upgrade weak_self_ during FD transition");
         }
@@ -98,6 +102,7 @@ void RdmaServerConnection::handle_read() {
     // Status is ESTABLISHED - handle RDMA completions
     // RDMA: Handle completions (appends to in_ buffer)
     rdma_endpoint_->handle_read();
+    Log_info("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
     if (in_.content_size() == 0) {
         return;
     }
@@ -120,6 +125,7 @@ void RdmaServerConnection::handle_read() {
         }
 
         // got a complete packet
+        Log_info("RdmaServerConnection: parsing packet_size=%d", packet_size);
         in_ >> packet_size;
 
         auto req = rusty::Box<Request>(new Request());
@@ -128,6 +134,7 @@ void RdmaServerConnection::handle_read() {
         v64 v_xid;
         req->m >> v_xid;
         req->xid = v_xid.get();
+        Log_info("RdmaServerConnection: got request xid=%ld", req->xid);
         complete_requests.push_back(std::move(req));
     }
 
@@ -152,6 +159,7 @@ void RdmaServerConnection::handle_read() {
 
         auto it = server_->handlers_.find(rpc_id);
         if (it != server_->handlers_.end()) {
+            Log_info("RdmaServerConnection: dispatching rpc_id=0x%08x", rpc_id);
             auto weak_this = weak_self_;
             it->second(std::move(req), weak_this);
         } else {
@@ -207,7 +215,31 @@ void RdmaServerConnection::end_reply() {
     out_l_.unlock();
 }
 
+void RdmaServerConnection::handle_error(uint32_t events) {
+    // RDMA completion channels can receive spurious EPOLLRDHUP events.
+    // Unlike TCP sockets, EPOLLRDHUP on a completion channel doesn't mean
+    // the peer disconnected. Only ignore pure EPOLLRDHUP; real errors should close.
+    if ((events & EPOLLRDHUP) && !(events & (EPOLLERR | EPOLLHUP))) {
+        Log_debug("RdmaServerConnection::handle_error() ignoring EPOLLRDHUP on fd=%d", fd());
+        return;
+    }
+    Log_info("RdmaServerConnection::handle_error() events=0x%x, closing", events);
+    close();
+}
+
 void RdmaServerConnection::close() {
+    Log_info("RdmaServerConnection::close() called, status=%d", status_);
+    // Print backtrace to find caller
+    void* callstack[20];
+    int frames = backtrace(callstack, 20);
+    char** symbols = backtrace_symbols(callstack, frames);
+    if (symbols) {
+        Log_info("RdmaServerConnection::close() backtrace:");
+        for (int i = 0; i < frames; i++) {
+            Log_info("  [%d] %s", i, symbols[i]);
+        }
+        free(symbols);
+    }
     if (status_ == CLOSED) {
         return;
     }

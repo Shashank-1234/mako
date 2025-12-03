@@ -307,7 +307,8 @@ int Client::connect(const char* addr) const {
 }
 
 // @safe - Simple error handler
-void Client::handle_error() {
+void Client::handle_error(uint32_t events) {
+  (void)events;  // Client closes on any error
   close();
 }
 

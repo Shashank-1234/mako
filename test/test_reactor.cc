@@ -70,7 +70,8 @@ public:
     }
 
     // @unsafe - Uses mutable field
-    void handle_error() override {
+    void handle_error(uint32_t events) override {
+        (void)events;  // Unused in test
         // @unsafe {
         if (error_handler_) {
             error_handler_();
