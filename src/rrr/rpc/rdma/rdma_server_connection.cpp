@@ -8,19 +8,19 @@ RdmaServerConnection::RdmaServerConnection(Server* server, int socket)
     
     // Override status to HANDSHAKING for RDMA connections
     status_ = HANDSHAKING;
-    
+
     Log_info("RdmaServerConnection: created with ctrl_socket=%d (handshake pending)", socket);
-    
+
     // Initialize RDMA endpoint (does not perform handshake yet)
     rdma_endpoint_ = std::make_unique<rdma::RdmaEndpoint>();
     if (!rdma_endpoint_->Initialize()) {
         Log_error("RdmaServerConnection: RDMA endpoint initialization failed");
         verify(0);
     }
-    
+
     // Set receive buffer for RDMA completions (used after handshake)
     rdma_endpoint_->SetReceiveBuffer(&in_);
-    
+
     // Note: We keep ctrl_socket_ in the poll thread for now
     // Handshake will be performed in handle_read()
 }
@@ -70,14 +70,27 @@ void RdmaServerConnection::handle_read() {
             handle_error();
             return;
         }
-        
+
         Log_info("RdmaServerConnection: Handshake complete, switching to RDMA completion channel");
+
+        // CRITICAL: The FD changes from TCP socket to RDMA completion channel.
+        // Remove with old FD (before status change), then add back with new FD.
+        // Remove while fd() still returns ctrl_socket_
+        server_->poll_thread_worker_.as_ref().unwrap()->remove(*this);
+
+        // Now transition to ESTABLISHED - fd() will return completion channel
         status_ = ESTABLISHED;
-        
-        // Update poll thread to monitor RDMA completion channel instead of TCP socket
-        // The fd() method will now return the completion channel FD
-        server_->poll_thread_worker_.as_ref().unwrap()->update_mode(*this, poll_mode());
-        
+
+        Log_info("RdmaServerConnection: FD transition %d -> %d", ctrl_socket_, fd());
+
+        // Add back with new FD (completion channel)
+        auto self_arc = weak_self_.upgrade();
+        if (self_arc.is_some()) {
+            server_->poll_thread_worker_.as_ref().unwrap()->add(self_arc.unwrap());
+        } else {
+            Log_error("RdmaServerConnection: Failed to upgrade weak_self_ during FD transition");
+        }
+
         Log_info("RdmaServerConnection: Now polling completion channel fd=%d", fd());
         return;
     }
@@ -85,7 +98,6 @@ void RdmaServerConnection::handle_read() {
     // Status is ESTABLISHED - handle RDMA completions
     // RDMA: Handle completions (appends to in_ buffer)
     rdma_endpoint_->handle_read();
-    
     if (in_.content_size() == 0) {
         return;
     }
@@ -197,23 +209,33 @@ void RdmaServerConnection::end_reply() {
 
 void RdmaServerConnection::close() {
     if (status_ == CLOSED) {
-        return;  // Already closed
+        return;
     }
-    
-    // Close RDMA-specific resources first
+
+    server_->sconns_l_.lock();
+    for (auto it = server_->sconns_.begin(); it != server_->sconns_.end(); ++it) {
+        if (it->get() == this) {
+            server_->sconns_.erase(it);
+            break;
+        }
+    }
+    server_->sconns_l_.unlock();
+
+    server_->poll_thread_worker_.as_ref().unwrap()->remove(*this);
+
+    // Close RDMA-specific resources
     if (rdma_endpoint_) {
         rdma_endpoint_->Close();
         rdma_endpoint_.reset();
     }
-    
-    // Close control socket if still open and different from base socket
-    if (ctrl_socket_ >= 0 && ctrl_socket_ != socket_) {
+
+    // Close control socket
+    if (ctrl_socket_ >= 0) {
         ::close(ctrl_socket_);
         ctrl_socket_ = -1;
     }
-    
-    // Call base class close() to handle common cleanup (sets status_ = CLOSED)
-    ServerConnection::close();
+
+    status_ = CLOSED;
 }
 
 } // namespace rrr

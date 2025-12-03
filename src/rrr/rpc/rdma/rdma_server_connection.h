@@ -9,7 +9,9 @@ namespace rrr {
 class RdmaServerConnection : public ServerConnection {
 public:
     RdmaServerConnection(Server* server, int socket);
-    virtual ~RdmaServerConnection() = default;
+    virtual ~RdmaServerConnection() {
+        Log_info("RdmaServerConnection: destroyed");
+    };
 
     // Override to return completion channel FD after handshake completes
     int fd() const override;

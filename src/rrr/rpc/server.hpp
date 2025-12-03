@@ -190,7 +190,7 @@ public:
 
     // Public destructor for shared_ptr compatibility
     // @safe - Simple destructor updating counter
-    ~ServerConnection();
+    virtual ~ServerConnection();
 
 
     // @unsafe - Initializes connection with socket
