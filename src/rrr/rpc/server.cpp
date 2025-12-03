@@ -263,9 +263,7 @@ void ServerConnection::handle_read() {
                 surpress_warning = true;
             }
             rpc_id_missing_l_s.unlock();
-            if (!surpress_warning) {
-                Log_error("rrr::ServerConnection: no handler for rpc_id=0x%08x", rpc_id);
-            }
+            Log_error("rrr::ServerConnection: no handler for rpc_id=0x%08x", rpc_id);
             begin_reply(*req, ENOENT);
             end_reply();
             // req automatically cleaned up by rusty::Box
@@ -532,12 +530,9 @@ void ServerListener::handle_read() {
         if (!is_local && transport == ReplicationTransport::RDMA) {
           Log_info("Creating RdmaServerConnection for remote client %s (fd=%d)", client_ip, clnt_socket);
           return rusty::Arc<ServerConnection>(rusty::Arc<RdmaServerConnection>::make(server_, clnt_socket));
-        } else {
-          if (is_local && transport == ReplicationTransport::RDMA) {
-            Log_info("Creating ServerConnection for local client %s (fd=%d) - using TCP for local", client_ip, clnt_socket);
-          }
-          return rusty::Arc<ServerConnection>::make(server_, clnt_socket);
-        }
+        } 
+        Log_info("Creating TCP ServerConnection for client %s (fd=%d) - using TCP for local", client_ip, clnt_socket);
+        return rusty::Arc<ServerConnection>::make(server_, clnt_socket);
       }();
 
       const_cast<ServerConnection&>(*sconn).weak_self_ = sconn;
@@ -684,6 +679,9 @@ int Server::start(const char* bind_addr) {
   string addr(bind_addr, strlen(bind_addr));
   sp_server_listener_ = rusty::Some(rusty::Arc<ServerListener>::make(this, addr));
   poll_thread_worker_.as_ref().unwrap()->add(sp_server_listener_.as_ref().unwrap().clone());
+  for (const auto& [rpc_id, handler] : handlers_) {
+    Log_info("  - RPC handler registered: id=%d", rpc_id);
+  }
   return 0;
 }
 
@@ -695,6 +693,7 @@ int Server::reg(i32 rpc_id, const RequestHandler& func) {
         return EEXIST;
     }
 
+    Log_info("rrr::Server::reg: registered handler for rpc_id %d", rpc_id);
     handlers_[rpc_id] = func;
 
     return 0;

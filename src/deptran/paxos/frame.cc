@@ -86,9 +86,13 @@ MultiPaxosFrame::CreateRpcServices(uint32_t site_id,
   auto config = Config::GetConfig();
   auto result = std::vector<Service *>();
   switch (config->replica_proto_) {
-    case MODE_MULTI_PAXOS:result.push_back(new MultiPaxosServiceImpl(rep_sched));
+    case MODE_MULTI_PAXOS:
+      Log_info("Creating MultiPaxosServiceImpl for site_id=%d", site_id);
+      result.push_back(new MultiPaxosServiceImpl(rep_sched));
+      break;
     default:break;
   }
+  Log_info("Created %zu RPC service(s) for site_id=%d", result.size(), site_id);
   return result;
 }
 

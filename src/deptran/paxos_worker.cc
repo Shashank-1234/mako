@@ -205,8 +205,15 @@ void PaxosWorker::SetupService() {
   rpc_server_ = new rrr::Server(svr_poll_thread_worker_.as_ref().unwrap(), thread_pool_g);
 
   // reg services
+  Log_info("Registering %zu RPC service(s) to server for site %s", 
+           services_.size(), site_info_->name.c_str());
   for (auto service : services_) {
-    rpc_server_->reg(service);
+    int reg_result = rpc_server_->reg(service);
+    if (reg_result == 0) {
+      Log_info("Successfully registered service %p to RPC server", service);
+    } else {
+      Log_error("Failed to register service %p, error code: %d", service, reg_result);
+    }
   }
 
   // start rpc server

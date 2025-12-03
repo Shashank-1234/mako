@@ -426,7 +426,8 @@ MultiPaxosCommo::BroadcastBulkAccept(parid_t par_id,
     int st = p.first;
     fuattr.callback = [e, cb, st] (rusty::Arc<Future> fu) {
       if (fu->get_error_code()!=0) {
-        Log_info("received an error message2");
+        Log_info("BroadcastBulkAccept: RPC failed to site %d, error_code=%d", 
+                 st, fu->get_error_code());
         return;
       }
       i32 valid;

@@ -7,7 +7,7 @@ namespace janus {
 
 MultiPaxosServiceImpl::MultiPaxosServiceImpl(TxLogServer *sched)
     : sched_((PaxosServer*)sched) {
-
+  Log_info("MultiPaxosServiceImpl constructed with scheduler=%p", sched);
 }
 
 void MultiPaxosServiceImpl::Forward(const MarshallDeputy& cmd,
