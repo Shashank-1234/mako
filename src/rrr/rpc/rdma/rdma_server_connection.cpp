@@ -216,6 +216,16 @@ void RdmaServerConnection::end_reply() {
 }
 
 void RdmaServerConnection::handle_error(uint32_t events) {
+    // Sanity check: valid epoll events are small values
+    // EPOLLIN=0x1, EPOLLOUT=0x4, EPOLLERR=0x8, EPOLLHUP=0x10, EPOLLRDHUP=0x2000
+    // Maximum valid combination is around 0x2FFF
+    if (events > 0x3FFF) {
+        Log_error("RdmaServerConnection::handle_error() INVALID events=0x%x (garbage?), this=%p, status=%d, fd=%d",
+                  events, this, status_, fd());
+        // Don't close on garbage - this is likely a bug
+        return;
+    }
+    
     // RDMA completion channels can receive spurious EPOLLRDHUP events.
     // Unlike TCP sockets, EPOLLRDHUP on a completion channel doesn't mean
     // the peer disconnected. Only ignore pure EPOLLRDHUP; real errors should close.

@@ -366,6 +366,8 @@ void Client::handle_read() {
     //Log_info("stuck in client handle_read loop");
     i32 packet_size;
     int n_peek = in_.borrow_mut()->peek(&packet_size, sizeof(i32));
+    Log_debug("Client::handle_read: n_peek=%d, packet_size=%d, content_size=%zu",
+              n_peek, packet_size, in_.borrow()->content_size());
     if (n_peek == sizeof(i32)
         && in_.borrow()->content_size() >= packet_size + sizeof(i32)) {
       // consume the packet size
@@ -376,9 +378,13 @@ void Client::handle_read() {
 
       *in_.borrow_mut() >> v_reply_xid >> v_error_code;
 
+      Log_debug("Client::handle_read: got reply xid=%ld, error_code=%d",
+                v_reply_xid.get(), v_error_code.get());
+
       pending_fu_l_.get()->lock();
       auto it = pending_fu_.borrow_mut()->find(v_reply_xid.get());
       if (it != pending_fu_.borrow_mut()->end()) {
+        Log_debug("Client::handle_read: found pending future for xid=%ld", v_reply_xid.get());
         rusty::Arc<Future> fu = it->second;  // Copy Arc (refcount still 2)
         verify(fu->xid_ == v_reply_xid.get());
         pending_fu_.borrow_mut()->erase(it);  // Remove from map (refcount 2→1)

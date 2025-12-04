@@ -286,6 +286,10 @@ class Epoll {
       }
 
       Pollable* poll = reinterpret_cast<Pollable*>(userdata);  // Direct cast - safe!
+      
+      // Debug: log the events being dispatched (use Log_info to ensure visibility)
+      Log_info("Epoll::Wait: dispatching fd=%d, events=0x%x, poll=%p", 
+               poll->fd(), evlist[i].events, (void*)poll);
 
       if (evlist[i].events & EPOLLIN) {
           poll->handle_read();
@@ -298,6 +302,7 @@ class Epoll {
       }
       // handle error after handle IO, so that we can at least process something
       if (evlist[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+          Log_info("Epoll::Wait: calling handle_error with events=0x%x", evlist[i].events);
           poll->handle_error(evlist[i].events);
       }
     }

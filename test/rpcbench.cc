@@ -102,6 +102,7 @@ static void* client_proc(void*) {
         }
     };
     fu_attr.callback = [&do_work] (rusty::Arc<Future> fu) {
+        Log_debug("rpcbench: callback triggered, error_code=%d", fu->get_error_code());
         if (fu->get_error_code() != 0) {
             return;
         }

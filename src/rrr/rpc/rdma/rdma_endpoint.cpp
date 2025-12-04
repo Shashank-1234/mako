@@ -685,17 +685,21 @@ void RdmaEndpoint::SetReceiveBuffer(Marshal* in_buffer) {
 
 ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
     if (state_ != State::ESTABLISHED) {
+        Log_debug("RdmaEndpoint::SendMessage: not connected");
         errno = ENOTCONN;
         return -1;
     }
     
     // Check flow control
-    if (window_size_.load(std::memory_order_relaxed) == 0) {
+    int window = window_size_.load(std::memory_order_relaxed);
+    if (window == 0) {
+        Log_debug("RdmaEndpoint::SendMessage: no flow control credits (window=0)");
         errno = EAGAIN;
         return -1;
     }
     
     size_t size = data.content_size();
+    Log_debug("RdmaEndpoint::SendMessage: sending %zu bytes, window=%d", size, window);
     if (size > DEFAULT_BUFFER_SIZE) {
         Log_error("Message too large: %zu > %u", size, DEFAULT_BUFFER_SIZE);
         errno = EMSGSIZE;
@@ -797,9 +801,14 @@ void RdmaEndpoint::HandleRecvCompletion(ibv_wc& wc) {
     uint16_t msg_size = imm >> 16;
     uint16_t ack_count = imm & 0xFFFF;
     
+    Log_debug("RdmaEndpoint::HandleRecvCompletion: msg_size=%u, ack_count=%u, in_buffer_=%p",
+              msg_size, ack_count, in_buffer_);
+    
     // Append received data to in_buffer (provided by Client/ServerConnection)
     if (msg_size > 0 && in_buffer_) {
         in_buffer_->write(buf, msg_size);
+        Log_debug("RdmaEndpoint::HandleRecvCompletion: wrote %u bytes, in_buffer_ size now %zu",
+                  msg_size, in_buffer_->content_size());
     }
     
     // Process ACKs (sender-side flow control)
