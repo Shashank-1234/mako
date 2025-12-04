@@ -655,6 +655,7 @@ int RdmaEndpoint::poll_mode() const {
 }
 
 void RdmaEndpoint::handle_read() {
+    Log_debug("RdmaEndpoint::handle_read() called, fd=%d", fd());
     // CQ has completion events
     HandleCompletions();
 }
@@ -747,19 +748,24 @@ ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
 }
 
 void RdmaEndpoint::HandleCompletions() {
-    // Acknowledge CQ event
+    // Get CQ event
     ibv_cq* ev_cq;
     void* ev_ctx;
-    if (ibv_get_cq_event(comp_channel_, &ev_cq, &ev_ctx) == 0) {
-        ibv_ack_cq_events(cq_, 1);
+    if (ibv_get_cq_event(comp_channel_, &ev_cq, &ev_ctx) != 0) {
+        Log_debug("RdmaEndpoint::HandleCompletions: ibv_get_cq_event failed, errno=%d", errno);
+        return;
     }
     
-    // Request next notification
+    // Arm for next notification BEFORE polling to avoid race
     ibv_req_notify_cq(cq_, 0);
     
     // Poll all available completions
     ibv_wc wc[32];
     int n = ibv_poll_cq(cq_, 32, wc);
+    Log_debug("RdmaEndpoint::HandleCompletions: polled %d completions", n);
+    
+    // Acknowledge AFTER polling
+    ibv_ack_cq_events(cq_, 1);
     
     for (int i = 0; i < n; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) {
