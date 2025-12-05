@@ -241,6 +241,9 @@ public:
         return socket_;
     }
 
+    // Get connection status
+    int status() const { return status_; }
+
     // @safe - Returns poll mode based on output buffer (TCP)
     virtual int poll_mode() const override {
         int mode = Pollable::READ;

@@ -1,6 +1,7 @@
 #include "rdma_server_connection.h"
 #include "../../base/all.hpp"
 #include <execinfo.h>
+#include <sys/timerfd.h>
 
 namespace rrr {
 
@@ -12,8 +13,8 @@ RdmaServerConnection::RdmaServerConnection(Server* server, int socket)
 
     Log_info("RdmaServerConnection: created with ctrl_socket=%d (handshake pending)", socket);
 
-    // Initialize RDMA endpoint (does not perform handshake yet)
-    rdma_endpoint_ = std::make_unique<rdma::RdmaEndpoint>();
+    // Initialize RDMA endpoint as SERVER type (resources allocated after HelloMessage)
+    rdma_endpoint_ = std::make_unique<rdma::RdmaEndpoint>(rdma::EndpointType::SERVER);
     if (!rdma_endpoint_->Initialize()) {
         Log_error("RdmaServerConnection: RDMA endpoint initialization failed");
         verify(0);
@@ -22,8 +23,14 @@ RdmaServerConnection::RdmaServerConnection(Server* server, int socket)
     // Set receive buffer for RDMA completions (used after handshake)
     rdma_endpoint_->SetReceiveBuffer(&in_);
 
-    // Note: We keep ctrl_socket_ in the poll thread for now
-    // Handshake will be performed in handle_read()
+    // Note: handshake thread is started via start_handshake() after weak_self_ is set
+}
+
+void RdmaServerConnection::start_handshake() {
+    // Start handshake in a separate thread to avoid blocking the poll thread
+    // Must be called after weak_self_ is initialized
+    Log_info("RdmaServerConnection: starting handshake thread for fd=%d", ctrl_socket_);
+    handshake_thread_ = std::thread(&RdmaServerConnection::handshake_thread_func, this);
 }
 
 int RdmaServerConnection::fd() const {
@@ -57,53 +64,51 @@ int RdmaServerConnection::poll_mode() const {
     }
 }
 
+void RdmaServerConnection::handshake_thread_func() {
+    Log_info("RdmaServerConnection: Handshake thread started for fd=%d", ctrl_socket_);
+    
+    // Perform RDMA handshake over TCP socket (blocking call)
+    if (!rdma_endpoint_->AcceptFrom(ctrl_socket_)) {
+        Log_error("RdmaServerConnection: RDMA handshake failed");
+        // Mark as failed and let the main thread handle cleanup
+        status_ = CLOSED;
+        handshake_complete_.store(true, std::memory_order_release);
+        return;
+    }
+
+    // Now transition to ESTABLISHED - fd() will return completion channel
+    status_ = ESTABLISHED;
+    handshake_complete_.store(true, std::memory_order_release);
+
+    // Add to poll with new FD (completion channel)
+    // This is safe because the connection was never added to poll during HANDSHAKING
+    auto self_arc = weak_self_.upgrade();
+    if (self_arc.is_some()) {
+        Log_info("RdmaServerConnection: Adding to poll with RDMA FD, self_arc strong_count=%zu", 
+                 self_arc.as_ref().unwrap().strong_count());
+        server_->poll_thread_worker_.as_ref().unwrap()->add(self_arc.unwrap());
+    } else {
+        Log_error("RdmaServerConnection: Failed to upgrade weak_self_ during FD transition");
+    }
+}
+
 void RdmaServerConnection::handle_read() {
     if (status_ == CLOSED) {
         return;
     }
 
     if (status_ == HANDSHAKING) {
-        Log_info("RdmaServerConnection: Starting server-side handshake on fd=%d", ctrl_socket_);
-        
-        // Perform RDMA handshake over TCP socket (blocking call)
-        if (!rdma_endpoint_->AcceptFrom(ctrl_socket_)) {
-            Log_error("RdmaServerConnection: RDMA handshake failed");
-            close();
-            return;
-        }
-
-        Log_info("RdmaServerConnection: Handshake complete, switching to RDMA completion channel");
-
-        // CRITICAL: The FD changes from TCP socket to RDMA completion channel.
-        // Remove with old FD (before status change), then add back with new FD.
-        // Remove while fd() still returns ctrl_socket_
-        server_->poll_thread_worker_.as_ref().unwrap()->remove(*this);
-
-        // Now transition to ESTABLISHED - fd() will return completion channel
-        status_ = ESTABLISHED;
-
-        Log_info("RdmaServerConnection: FD transition %d -> %d", ctrl_socket_, fd());
-
-        // Add back with new FD (completion channel)
-        auto self_arc = weak_self_.upgrade();
-        if (self_arc.is_some()) {
-            Log_info("RdmaServerConnection: Adding to poll with new FD, self_arc strong_count=%zu", 
-                     self_arc.as_ref().unwrap().strong_count());
-            server_->poll_thread_worker_.as_ref().unwrap()->add(self_arc.unwrap());
-            Log_info("RdmaServerConnection: After add()");
-        } else {
-            Log_error("RdmaServerConnection: Failed to upgrade weak_self_ during FD transition");
-        }
-
-        Log_info("RdmaServerConnection: Now polling completion channel fd=%d", fd());
+        // Handshake is happening in a separate thread, should not get here
+        Log_warn("RdmaServerConnection::handle_read() called during HANDSHAKING - ignoring");
         return;
     }
 
     // Status is ESTABLISHED - handle RDMA completions
     // RDMA: Handle completions (appends to in_ buffer)
     rdma_endpoint_->handle_read();
-    Log_info("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
+    Log_debug("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
     if (in_.content_size() == 0) {
+        Log_debug("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
         return;
     }
 
@@ -130,7 +135,7 @@ void RdmaServerConnection::handle_read() {
 
         auto req = rusty::Box<Request>(new Request());
         verify(req->m.read_from_marshal(in_, packet_size) == (size_t) packet_size);
-        
+
         v64 v_xid;
         req->m >> v_xid;
         req->xid = v_xid.get();
@@ -222,6 +227,15 @@ void RdmaServerConnection::handle_error(uint32_t events) {
     if (events > 0x3FFF) {
         Log_error("RdmaServerConnection::handle_error() INVALID events=0x%x (garbage?), this=%p, status=%d, fd=%d",
                   events, this, status_, fd());
+        // Print backtrace to find caller
+        void* callstack[20];
+        int frames = backtrace(callstack, 20);
+        char** symbols = backtrace_symbols(callstack, frames);
+        Log_error("RdmaServerConnection::handle_error() backtrace:");
+        for (int i = 0; i < frames; i++) {
+            Log_error("  [%d] %s", i, symbols[i]);
+        }
+        free(symbols);
         // Don't close on garbage - this is likely a bug
         return;
     }
@@ -239,17 +253,7 @@ void RdmaServerConnection::handle_error(uint32_t events) {
 
 void RdmaServerConnection::close() {
     Log_info("RdmaServerConnection::close() called, status=%d", status_);
-    // Print backtrace to find caller
-    void* callstack[20];
-    int frames = backtrace(callstack, 20);
-    char** symbols = backtrace_symbols(callstack, frames);
-    if (symbols) {
-        Log_info("RdmaServerConnection::close() backtrace:");
-        for (int i = 0; i < frames; i++) {
-            Log_info("  [%d] %s", i, symbols[i]);
-        }
-        free(symbols);
-    }
+    
     if (status_ == CLOSED) {
         return;
     }

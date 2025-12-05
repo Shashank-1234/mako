@@ -164,7 +164,7 @@ public:
 // Client is accessed from multiple threads (main + PollThread), so SpinLocks provide synchronization
 // MIGRATED: Now uses rusty::Arc<Client> with explicit weak self-reference instead of shared_from_this()
 class Client: public Pollable {
-    rusty::RefCell<Marshal> in_;
+    mutable Marshal in_;
     rusty::RefCell<Marshal> out_;
 
     /**
@@ -221,7 +221,7 @@ public:
 
 
     Client(rusty::Arc<PollThread> poll_thread_worker):
-        in_(),              // Default-constructs RefCell<Marshal>
+        in_(),              // Default-constructs Marshal
         out_(),             // Default-constructs RefCell<Marshal>
         poll_thread_worker_(poll_thread_worker),
         weak_self_(),       // Default-constructs RefCell<Weak<Client>>

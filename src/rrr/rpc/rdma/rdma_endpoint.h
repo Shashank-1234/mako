@@ -13,16 +13,24 @@
 namespace rrr {
 namespace rdma {
 
+// Endpoint type - determines when resources are allocated
+enum class EndpointType {
+    CLIENT,  // Allocate resources in Initialize() (before ConnectTo)
+    SERVER   // Defer allocation until HelloMessage received (in AcceptFrom)
+};
+
 // RDMA connection endpoint
 // Manages QP, CQ, send/recv buffers, and flow control
 // Implements Pollable for integration with PollThread
 class RdmaEndpoint : public Pollable {
 public:
-    RdmaEndpoint();
+    // Default is CLIENT type
+    RdmaEndpoint(EndpointType type = EndpointType::CLIENT);
     ~RdmaEndpoint();
-    
+
     // Initialize resources (QP, CQ, buffers)
-    // Must be called before Connect
+    // For CLIENT: allocates resources immediately
+    // For SERVER: just marks as initialized, resources allocated in AcceptFrom
     bool Initialize();
     
     // Connection establishment (client-side)
@@ -100,6 +108,9 @@ private:
     
     // Resource allocation/deallocation
     bool AllocateResources();
+
+    bool CreateCompletionChannel();
+
     void DeallocateResources();
     
     // Handshake helpers
@@ -112,15 +123,21 @@ private:
     int WriteToFd(int fd, const void* data, size_t len);
     
     // Send/Recv helpers
-    bool PostRecv(uint32_t count);
+    bool PostRecv(uint32_t count);        // Post multiple recvs (initial posting)
+    bool PostRecvBuffer(uint16_t rq_idx); // Re-post specific buffer after completion
     
     // Completion handling
     void HandleSendCompletion(ibv_wc& wc);
     void HandleRecvCompletion(ibv_wc& wc);
     void HandleCompletions();  // Process all pending completions
     
+    // Flow control - ACK handling
+    int SendAck(int num);      // Track ACKs, send pure ACK if threshold exceeded
+    int SendImm(uint32_t imm); // Send pure ACK message (no data)
+
     // State
     State state_;
+    EndpointType type_;
     
     // Receive buffer (provided by Client/ServerConnection)
     Marshal* in_buffer_;  // Not owned, just a reference
@@ -129,6 +146,7 @@ private:
     ibv_qp* qp_;                         // Queue Pair
     ibv_cq* cq_;                         // Completion Queue
     ibv_comp_channel* comp_channel_;     // Completion channel (for epoll)
+
     
     // Queue sizes
     uint16_t sq_size_;                   // Send queue size (default 128)
@@ -148,6 +166,8 @@ private:
     // Queue indices
     uint16_t sq_current_;                // Next send slot
     uint16_t rq_received_;               // Receives processed
+
+    int tcp_fd; // Client TCP Socket
     
     // Configuration
     static const uint32_t DEFAULT_BUFFER_SIZE = 8192;   // 8KB

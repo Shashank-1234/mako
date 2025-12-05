@@ -539,7 +539,17 @@ void ServerListener::handle_read() {
       server_->sconns_l_.lock();
       server_->sconns_.insert(sconn.clone());
       server_->sconns_l_.unlock();
-      server_->poll_thread_worker_.as_ref().unwrap()->add(sconn);
+
+      // RDMA connections handle their own poll registration after handshake completes
+      if (sconn->status() == ServerConnection::HANDSHAKING) {
+        // Start the handshake thread now that weak_self_ is set
+        auto* rdma_conn = dynamic_cast<RdmaServerConnection*>(const_cast<ServerConnection*>(sconn.get()));
+        if (rdma_conn) {
+          rdma_conn->start_handshake();
+        }
+      } else {
+        server_->poll_thread_worker_.as_ref().unwrap()->add(sconn);
+      }
     } else {
       break;
     }

@@ -2,6 +2,8 @@
 
 #include "../server.hpp"
 #include "rdma_endpoint.h"
+#include <thread>
+#include <atomic>
 
 namespace rrr {
 
@@ -9,7 +11,14 @@ namespace rrr {
 class RdmaServerConnection : public ServerConnection {
 public:
     RdmaServerConnection(Server* server, int socket);
+
+    // Start the handshake thread. Must be called after weak_self_ is set.
+    void start_handshake();
+
     virtual ~RdmaServerConnection() {
+        if (handshake_thread_.joinable()) {
+            handshake_thread_.join();
+        }
         Log_info("RdmaServerConnection: destroyed");
     };
 
@@ -35,8 +44,12 @@ public:
     void handle_error(uint32_t events) override;
 
 private:
+    void handshake_thread_func();
+
     std::unique_ptr<rdma::RdmaEndpoint> rdma_endpoint_;
     int ctrl_socket_;  // TCP socket used for handshake
+    std::thread handshake_thread_;
+    std::atomic<bool> handshake_complete_{false};
 };
 
 } // namespace rrr

@@ -245,7 +245,7 @@ int Client::RdmaConnect(const char* addr) const {
   }
 
   // Set receive buffer for RDMA completions
-  rdma_endpoint_->SetReceiveBuffer(&*in_.borrow_mut());
+  rdma_endpoint_->SetReceiveBuffer(&in_);
 
   // Perform RDMA handshake synchronously over TCP socket
   if (!rdma_endpoint_->ConnectTo(host.c_str(), std::stoi(port))) {
@@ -349,14 +349,14 @@ void Client::handle_read() {
     rdma_endpoint_->handle_read();
   } else {
     // TCP: Read from socket
-    int bytes_read = in_.borrow_mut()->read_from_fd(sock_.get());
+    int bytes_read = in_.read_from_fd(sock_.get());
     
     // Optimization: If no new data was read AND buffer is empty, return early.
     // CRITICAL BUG FIX: With edge-triggered epoll (EPOLLET), we MUST check if
     // there's buffered data to process. The old code would return early even when
     // content_size() > 0, causing futures to hang because buffered packets never
     // got processed and we'd lose the edge trigger.
-    if (bytes_read == 0 && in_.borrow()->content_size() == 0) {
+    if (bytes_read == 0 && in_.content_size() == 0) {
       return;
     }
   }
@@ -365,18 +365,18 @@ void Client::handle_read() {
   for (;;) {
     //Log_info("stuck in client handle_read loop");
     i32 packet_size;
-    int n_peek = in_.borrow_mut()->peek(&packet_size, sizeof(i32));
+    int n_peek = in_.peek(&packet_size, sizeof(i32));
     Log_debug("Client::handle_read: n_peek=%d, packet_size=%d, content_size=%zu",
-              n_peek, packet_size, in_.borrow()->content_size());
+              n_peek, packet_size, in_.content_size());
     if (n_peek == sizeof(i32)
-        && in_.borrow()->content_size() >= packet_size + sizeof(i32)) {
+        && in_.content_size() >= packet_size + sizeof(i32)) {
       // consume the packet size
-      verify(in_.borrow_mut()->read(&packet_size, sizeof(i32)) == sizeof(i32));
+      verify(in_.read(&packet_size, sizeof(i32)) == sizeof(i32));
 
       v64 v_reply_xid;
       v32 v_error_code;
 
-      *in_.borrow_mut() >> v_reply_xid >> v_error_code;
+      in_ >> v_reply_xid >> v_error_code;
 
       Log_debug("Client::handle_read: got reply xid=%ld, error_code=%d",
                 v_reply_xid.get(), v_error_code.get());
@@ -391,7 +391,7 @@ void Client::handle_read() {
         pending_fu_l_.get()->unlock();
 
         fu->error_code_.set(v_error_code.get());
-        fu->reply_.get()->read_from_marshal(*in_.borrow_mut(),
+        fu->reply_.get()->read_from_marshal(in_,
                                             packet_size - v_reply_xid.val_size()
                                                 - v_error_code.val_size());
 
