@@ -45,6 +45,10 @@ public:
 
 private:
     void handshake_thread_func();
+    
+    // Process a single message immediately (called from RDMA callback)
+    // Reads from in_ buffer which has been populated by RdmaEndpoint
+    void process_message();
 
     std::unique_ptr<rdma::RdmaEndpoint> rdma_endpoint_;
     int ctrl_socket_;  // TCP socket used for handshake

@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <atomic>
+#include <functional>
 #include "../../misc/marshal.hpp"
 #include "../../reactor/epoll_wrapper.h"
 
@@ -65,9 +66,15 @@ public:
     // NOTE: Non-blocking! Always returns immediately
     ssize_t SendMessage(Marshal& data);
     
-    // Set Marshal buffer for appending received data
+    // Set Marshal buffer for appending received data (legacy mode)
     // Called by Client/ServerConnection to provide their in_ buffer
     void SetReceiveBuffer(Marshal* in_buffer);
+    
+    // Callback for immediate message processing (low-latency mode)
+    // Called for each received message with raw data pointer and length
+    // Callback should process and reply immediately
+    using OnMessageCallback = std::function<void(void* data, size_t len)>;
+    void SetOnMessageCallback(OnMessageCallback callback);
     
     // Get window size for flow control check
     uint16_t GetWindowSize() const { return window_size_.load(); }
@@ -141,6 +148,9 @@ private:
     
     // Receive buffer (provided by Client/ServerConnection)
     Marshal* in_buffer_;  // Not owned, just a reference
+    
+    // Callback for immediate message processing
+    OnMessageCallback on_message_callback_;
     
     // RDMA resources
     ibv_qp* qp_;                         // Queue Pair

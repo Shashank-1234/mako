@@ -2,6 +2,7 @@
 #include "../../base/all.hpp"
 #include <execinfo.h>
 #include <sys/timerfd.h>
+#include <cstring>
 
 namespace rrr {
 
@@ -20,8 +21,15 @@ RdmaServerConnection::RdmaServerConnection(Server* server, int socket)
         verify(0);
     }
 
-    // Set receive buffer for RDMA completions (used after handshake)
+    // Set receive buffer for RDMA completions
     rdma_endpoint_->SetReceiveBuffer(&in_);
+    
+    // Set callback for immediate message processing (low-latency mode)
+    // Each message is processed and replied to immediately as it arrives
+    rdma_endpoint_->SetOnMessageCallback([this](void* data, size_t len) {
+        (void)data; (void)len;  // Unused - we read from in_ buffer
+        this->process_message();
+    });
 
     // Note: handshake thread is started via start_handshake() after weak_self_ is set
 }
@@ -104,79 +112,55 @@ void RdmaServerConnection::handle_read() {
     }
 
     // Status is ESTABLISHED - handle RDMA completions
-    // RDMA: Handle completions (appends to in_ buffer)
+    // In callback mode, process_message is called directly for each received message
+    // This provides lower latency by processing and replying immediately
     rdma_endpoint_->handle_read();
-    Log_debug("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
-    if (in_.content_size() == 0) {
-        Log_debug("RdmaServerConnection::handle_read: in_.content_size()=%zu", in_.content_size());
+}
+
+void RdmaServerConnection::process_message() {
+    // Parse packet from in_ buffer (already populated by RdmaEndpoint)
+    // Format: <packet_size:i32> <xid:v64> <rpc_id:i32> <payload...>
+    
+    // Read packet_size
+    i32 packet_size;
+    in_ >> packet_size;
+    
+    // Create request and read payload
+    auto req = rusty::Box<Request>(new Request());
+    verify(req->m.read_from_marshal(in_, packet_size) == (size_t)packet_size);
+    
+    v64 v_xid;
+    req->m >> v_xid;
+    req->xid = v_xid.get();
+    
+    if (req->m.content_size() < sizeof(i32)) {
+        // rpc id not provided
+        begin_reply(*req, EINVAL);
+        end_reply();
         return;
     }
-
-    // Process all complete packets in the buffer
-    std::list<rusty::Box<Request>> complete_requests;
     
-    while (true) {
-        i32 packet_size;
-        int n_peek = in_.peek(&packet_size, sizeof(i32));
-        
-        if (n_peek != sizeof(i32)) {
-            // not enough data to read packet size
-            break;
-        }
-
-        if (in_.content_size() < packet_size + sizeof(i32)) {
-            // packet not complete
-            break;
-        }
-
-        // got a complete packet
-        Log_info("RdmaServerConnection: parsing packet_size=%d", packet_size);
-        in_ >> packet_size;
-
-        auto req = rusty::Box<Request>(new Request());
-        verify(req->m.read_from_marshal(in_, packet_size) == (size_t) packet_size);
-
-        v64 v_xid;
-        req->m >> v_xid;
-        req->xid = v_xid.get();
-        Log_info("RdmaServerConnection: got request xid=%ld", req->xid);
-        complete_requests.push_back(std::move(req));
-    }
+    i32 rpc_id;
+    req->m >> rpc_id;
 
 #ifdef RPC_STATISTICS
-    stat_server_batching(complete_requests.size());
+    stat_server_rpc_counting(rpc_id);
 #endif // RPC_STATISTICS
 
-    for (auto& req: complete_requests) {
-        if (req->m.content_size() < sizeof(i32)) {
-            // rpc id not provided
-            begin_reply(*req, EINVAL);
-            end_reply();
-            continue;
+    auto it = server_->handlers_.find(rpc_id);
+    if (it != server_->handlers_.end()) {
+        Log_debug("RdmaServerConnection: dispatching rpc_id=0x%08x, xid=%ld", rpc_id, req->xid);
+        auto weak_this = weak_self_;
+        it->second(std::move(req), weak_this);
+    } else {
+        rpc_id_missing_l_s.lock();
+        if (rpc_id_missing_s.find(rpc_id) == rpc_id_missing_s.end()) {
+            Log_warn("rrr::ServerConnection: no handler for rpc_id=0x%08x", rpc_id);
+            rpc_id_missing_s.insert(rpc_id);
         }
-
-        i32 rpc_id;
-        req->m >> rpc_id;
-
-#ifdef RPC_STATISTICS
-        stat_server_rpc_counting(rpc_id);
-#endif // RPC_STATISTICS
-
-        auto it = server_->handlers_.find(rpc_id);
-        if (it != server_->handlers_.end()) {
-            Log_info("RdmaServerConnection: dispatching rpc_id=0x%08x", rpc_id);
-            auto weak_this = weak_self_;
-            it->second(std::move(req), weak_this);
-        } else {
-            rpc_id_missing_l_s.lock();
-            if (rpc_id_missing_s.find(rpc_id) == rpc_id_missing_s.end()) {
-                Log_warn("rrr::ServerConnection: no handler for rpc_id=0x%08x", rpc_id);
-                rpc_id_missing_s.insert(rpc_id);
-            }
-            rpc_id_missing_l_s.unlock();
-            begin_reply(*req, ENOENT);
-            end_reply();
-        }
+        rpc_id_missing_l_s.unlock();
+        begin_reply(*req, ENOENT);
+        end_reply();
     }
 }
 

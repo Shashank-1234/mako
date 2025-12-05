@@ -210,6 +210,10 @@ class Client: public Pollable {
     
     // @unsafe - Establishes RDMA connection with async handshake
     int RdmaConnect(const char* addr) const;
+    
+    // Process a single RDMA response immediately (called from RDMA callback)
+    // Reads from in_ buffer which has been populated by RdmaEndpoint
+    void process_response() const;
 
 public:
 

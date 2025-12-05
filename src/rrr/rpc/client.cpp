@@ -246,6 +246,12 @@ int Client::RdmaConnect(const char* addr) const {
 
   // Set receive buffer for RDMA completions
   rdma_endpoint_->SetReceiveBuffer(&in_);
+  
+  // Set callback for immediate response processing (low-latency mode)
+  rdma_endpoint_->SetOnMessageCallback([this](void* data, size_t len) {
+    (void)data; (void)len;  // Unused - we read from in_ buffer
+    this->process_response();
+  });
 
   // Perform RDMA handshake synchronously over TCP socket
   if (!rdma_endpoint_->ConnectTo(host.c_str(), std::stoi(port))) {
@@ -345,8 +351,9 @@ void Client::handle_read() {
   }
 
   if (transport_ == rrr::ReplicationTransport::RDMA && rdma_endpoint_) {
-    // RDMA: Handle completions (appends to in_ buffer)
+    // RDMA: Handle completions - callback processes each response immediately
     rdma_endpoint_->handle_read();
+    return;  // Callback handles everything, no buffer processing needed
   } else {
     // TCP: Read from socket
     int bytes_read = in_.read_from_fd(sock_.get());
@@ -407,6 +414,45 @@ void Client::handle_read() {
       // packet incomplete or no more packets to process
       break;
     }
+  }
+}
+
+// Process a single RDMA response immediately (called from RDMA callback)
+void Client::process_response() const {
+  // Parse response from in_ buffer (already populated by RdmaEndpoint)
+  // Format: <packet_size:i32> <xid:v64> <error_code:v32> <reply_data...>
+  
+  // Read packet_size
+  i32 packet_size;
+  verify(in_.read(&packet_size, sizeof(i32)) == sizeof(i32));
+  
+  v64 v_reply_xid;
+  v32 v_error_code;
+  in_ >> v_reply_xid >> v_error_code;
+  
+  Log_debug("Client::process_response: got reply xid=%ld, error_code=%d",
+            v_reply_xid.get(), v_error_code.get());
+  
+  pending_fu_l_.get()->lock();
+  auto it = pending_fu_.borrow_mut()->find(v_reply_xid.get());
+  if (it != pending_fu_.borrow_mut()->end()) {
+    Log_debug("Client::process_response: found pending future for xid=%ld", v_reply_xid.get());
+    rusty::Arc<Future> fu = it->second;  // Copy Arc (refcount still 2)
+    verify(fu->xid_ == v_reply_xid.get());
+    pending_fu_.borrow_mut()->erase(it);  // Remove from map (refcount 2→1)
+    pending_fu_l_.get()->unlock();
+    
+    fu->error_code_.set(v_error_code.get());
+    fu->reply_.get()->read_from_marshal(in_,
+                                        packet_size - v_reply_xid.val_size()
+                                            - v_error_code.val_size());
+    
+    fu->notify_ready(fu);  // Pass Arc to self for callback safety
+    
+    // Arc auto-released when scope exits (refcount 1→0 if user released theirs)
+  } else {
+    // the future might timed out
+    pending_fu_l_.get()->unlock();
   }
 }
 

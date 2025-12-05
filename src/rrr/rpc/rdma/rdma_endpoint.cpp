@@ -139,7 +139,7 @@ bool RdmaEndpoint::AllocateResources() {
     }
 
     // Request notification on CQ (0 = all completions, not just solicited)
-    if (ibv_req_notify_cq(cq_, 0) != 0) {
+    if (ibv_req_notify_cq(cq_, 1) != 0) {
         Log_error("Failed to request CQ notification: %s", strerror(errno));
         return false;
     }
@@ -347,7 +347,7 @@ bool RdmaEndpoint::BringUpQp(uint16_t remote_lid, ibv_gid remote_gid, uint32_t r
     }
 
     // Try to arm again
-    if (ibv_req_notify_cq(cq_, 0) != 0) {
+    if (ibv_req_notify_cq(cq_, 1) != 0) {
         Log_debug("RdmaEndpoint::HandleCompletions: ibv_req_notify_cq failed, errno=%d", errno);
     }
 
@@ -766,6 +766,10 @@ void RdmaEndpoint::SetReceiveBuffer(Marshal* in_buffer) {
     in_buffer_ = in_buffer;
 }
 
+void RdmaEndpoint::SetOnMessageCallback(OnMessageCallback callback) {
+    on_message_callback_ = std::move(callback);
+}
+
 ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
     if (state_ != State::ESTABLISHED) {
         Log_debug("RdmaEndpoint::SendMessage: not connected");
@@ -909,26 +913,31 @@ void RdmaEndpoint::HandleRecvCompletion(ibv_wc& wc) {
     uint32_t ack_count = ntohl(wc.imm_data);
     uint32_t msg_size = wc.byte_len;
 
-    Log_debug("RdmaEndpoint::HandleRecvCompletion: rq_idx=%u, msg_size=%u, ack_count=%u, in_buffer_=%p",
-              rq_idx, msg_size, ack_count, in_buffer_);
+    Log_debug("RdmaEndpoint::HandleRecvCompletion: rq_idx=%u, msg_size=%u, ack_count=%u",
+              rq_idx, msg_size, ack_count);
+
+    // Process ACKs (sender-side flow control)
+    if (ack_count > 0) {
+        // Remote acknowledges it processed our sends
+        window_size_.fetch_add(ack_count, std::memory_order_relaxed);
+    }
 
     // Append received data to in_buffer
     if (msg_size > 0 && in_buffer_) {
         in_buffer_->write(buf, msg_size);
         Log_debug("RdmaEndpoint::HandleRecvCompletion: wrote %u bytes, in_buffer_ size now %zu",
                   msg_size, in_buffer_->content_size());
-    }
-
-    // Process ACKs (sender-side flow control)
-    if (ack_count > 0) {
-        // Remote acknowledges it processed our sends
-        window_size_.fetch_add(ack_count, std::memory_order_relaxed);
-
-        // // Free corresponding send buffers
-        // // (bRPC pattern: cleanup happens on ACK, not send completion)
-        // for (uint16_t i = 0; i < ack_count; i++) {
-        //     // Send buffers will be reused automatically via circular index
-        // }
+        
+        // If callback is set, check if we have a complete packet and process immediately
+        if (on_message_callback_) {
+            // Peek at packet_size to see if we have a complete packet
+            i32 packet_size;
+            while (in_buffer_->peek(&packet_size, sizeof(i32)) == sizeof(i32) &&
+                   in_buffer_->content_size() >= (size_t)(packet_size + sizeof(i32))) {
+                // Complete packet available - call callback to process it immediately
+                on_message_callback_(nullptr, 0);  // Signal to process from in_buffer_
+            }
+        }
     }
 
     // Re-post the receive buffer that was just consumed
@@ -946,9 +955,9 @@ int RdmaEndpoint::SendAck(int num) {
     // If accumulated ACKs exceed half the remote window, send pure ACK immediately
     // to avoid deadlock (remote waiting for ACKs, we waiting for data to piggyback on)
     uint16_t prev = new_rq_wrs_.fetch_add(num, std::memory_order_relaxed);
-    if (prev + num > rq_size_ / 2) {
+    if (prev + num > rq_size_ / 4) {
         return SendImm(new_rq_wrs_.exchange(0, std::memory_order_relaxed));
-    }
+    } 
     return 0;
 }
 
