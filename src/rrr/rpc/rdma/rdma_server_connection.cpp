@@ -149,7 +149,7 @@ void RdmaServerConnection::process_message() {
 
     auto it = server_->handlers_.find(rpc_id);
     if (it != server_->handlers_.end()) {
-        Log_debug("RdmaServerConnection: dispatching rpc_id=0x%08x, xid=%ld", rpc_id, req->xid);
+        // Log_debug("RdmaServerConnection: dispatching rpc_id=0x%08x, xid=%ld", rpc_id, req->xid);
         auto weak_this = weak_self_;
         it->second(std::move(req), weak_this);
     } else {

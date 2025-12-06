@@ -286,10 +286,6 @@ class Epoll {
       }
 
       Pollable* poll = reinterpret_cast<Pollable*>(userdata);  // Direct cast - safe!
-      
-      // Debug: log the events being dispatched (use Log_info to ensure visibility)
-      Log_info("Epoll::Wait: dispatching fd=%d, events=0x%x, poll=%p", 
-               poll->fd(), evlist[i].events, (void*)poll);
 
       if (evlist[i].events & EPOLLIN) {
           poll->handle_read();

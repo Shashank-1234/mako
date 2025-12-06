@@ -345,26 +345,36 @@ void PollThreadWorker::do_add_pollable(rusty::Arc<Pollable> sp_poll) {
   int fd = sp_poll->fd();
   int poll_mode = sp_poll->poll_mode();
 
+  Log_info("PollThreadWorker::do_add_pollable: fd=%d, poll_mode=%d, map_size=%zu", 
+           fd, poll_mode, fd_to_pollable_.size());
+
   // Check if already exists
   if (fd_to_pollable_.find(fd) != fd_to_pollable_.end()) {
+    Log_warn("PollThreadWorker::do_add_pollable: fd=%d already exists in map, skipping!", fd);
     return;
   }
 
   // Store in maps
   fd_to_pollable_.insert_or_assign(fd, sp_poll.clone());
   mode_[fd] = poll_mode;
+  Log_info("PollThreadWorker::do_add_pollable: fd=%d added to map, new map_size=%zu", 
+           fd, fd_to_pollable_.size());
 
   // userdata = raw Pollable* for lookup
   void* userdata = const_cast<void*>(static_cast<const void*>(sp_poll.get()));
   poll_.Add(sp_poll, userdata);
+  Log_info("PollThreadWorker::do_add_pollable: fd=%d added to epoll, userdata %p", fd, (void *)userdata);
 }
 
 void PollThreadWorker::do_remove_pollable(int fd) {
+  Log_info("PollThreadWorker::do_remove_pollable: fd=%d, map_size=%zu", fd, fd_to_pollable_.size());
   if (fd_to_pollable_.find(fd) == fd_to_pollable_.end()) {
+    Log_warn("PollThreadWorker::do_remove_pollable: fd=%d NOT found in map!", fd);
     return;
   }
   // Add to pending_remove (actual removal happens after epoll_wait)
   pending_remove_.insert(fd);
+  Log_info("PollThreadWorker::do_remove_pollable: fd=%d added to pending_remove", fd);
 }
 
 void PollThreadWorker::do_update_mode(int fd, int new_mode, Pollable* poll_ptr) {
@@ -414,6 +424,7 @@ void PollThreadWorker::process_pending_removals() {
 
     fd_to_pollable_.erase(it);
     mode_.erase(fd);
+    Log_debug("[poll_loop] Removed fd=%d from maps", fd);
   }
 }
 
@@ -509,7 +520,9 @@ void PollThread::add(rusty::Arc<Pollable> poll) const {
 }
 
 void PollThread::remove(Pollable& poll) const {
-  sender_.send(CmdRemovePollable{poll.fd()});
+  int fd = poll.fd();
+  Log_info("PollThread::remove: sending remove for fd=%d", fd);
+  sender_.send(CmdRemovePollable{fd});
 }
 
 void PollThread::update_mode(Pollable& poll, int new_mode) const {

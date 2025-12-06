@@ -430,13 +430,13 @@ void Client::process_response() const {
   v32 v_error_code;
   in_ >> v_reply_xid >> v_error_code;
   
-  Log_debug("Client::process_response: got reply xid=%ld, error_code=%d",
-            v_reply_xid.get(), v_error_code.get());
+  // Log_debug("Client::process_response: got reply xid=%ld, error_code=%d",
+  //           v_reply_xid.get(), v_error_code.get());
   
   pending_fu_l_.get()->lock();
   auto it = pending_fu_.borrow_mut()->find(v_reply_xid.get());
   if (it != pending_fu_.borrow_mut()->end()) {
-    Log_debug("Client::process_response: found pending future for xid=%ld", v_reply_xid.get());
+    // Log_debug("Client::process_response: found pending future for xid=%ld", v_reply_xid.get());
     rusty::Arc<Future> fu = it->second;  // Copy Arc (refcount still 2)
     verify(fu->xid_ == v_reply_xid.get());
     pending_fu_.borrow_mut()->erase(it);  // Remove from map (refcount 2→1)

@@ -13,7 +13,7 @@ namespace rrr {
 namespace rdma {
 
 // Configuration (can be made flags later)
-static const size_t DEFAULT_INITIAL_SIZE_MB = 64;  // 64MB (reduced from 1GB for stability)
+static const size_t DEFAULT_INITIAL_SIZE_MB = 128;  // 128MB
 static const size_t BYTES_IN_MB = 1048576;
 static const size_t MAX_REGIONS = 16;
 

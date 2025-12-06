@@ -169,6 +169,9 @@ private:
     // Receive buffers (pre-registered memory)
     std::vector<void*> recv_buffers_;    // Raw buffers for RDMA
     
+    // Cached lkey for send/recv buffers (avoid mutex lock on every operation)
+    uint32_t cached_lkey_;               // lkey from block pool
+    
     // Flow control
     std::atomic<uint16_t> window_size_;      // Credits available (sender-side)
     std::atomic<uint16_t> new_rq_wrs_;       // ACKs to send (receiver-side)
@@ -181,8 +184,8 @@ private:
     
     // Configuration
     static const uint32_t DEFAULT_BUFFER_SIZE = 8192;   // 8KB
-    static const uint16_t DEFAULT_SQ_SIZE = 128;
-    static const uint16_t DEFAULT_RQ_SIZE = 128;
+    static const uint16_t DEFAULT_SQ_SIZE = 256;
+    static const uint16_t DEFAULT_RQ_SIZE = 256;
     static const uint16_t ACK_THRESHOLD = 16;           // Send ACK every 16 receives
     
     // Disable copy

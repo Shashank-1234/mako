@@ -55,6 +55,7 @@ RdmaEndpoint::RdmaEndpoint(EndpointType type)
     , comp_channel_(nullptr)
     , sq_size_(DEFAULT_SQ_SIZE)
     , rq_size_(DEFAULT_RQ_SIZE)
+    , cached_lkey_(0)
     , window_size_(0)
     , new_rq_wrs_(0)
     , sq_current_(0)
@@ -182,6 +183,10 @@ bool RdmaEndpoint::AllocateResources() {
             return false;
         }
     }
+    
+    // Cache lkey from first buffer (all buffers from same region have same lkey)
+    cached_lkey_ = GetRegionId(send_buffers_[0]);
+    Log_info("RdmaEndpoint: cached lkey=%u", cached_lkey_);
     
     Log_info("RdmaEndpoint: allocated QP num=%u, SQ=%u, RQ=%u", 
              qp_->qp_num, sq_size_, rq_size_);
@@ -374,8 +379,8 @@ bool RdmaEndpoint::PostRecvBuffer(uint16_t rq_idx) {
     ibv_sge sge;
     sge.addr = (uint64_t)buf;
     sge.length = DEFAULT_BUFFER_SIZE;
-    sge.lkey = GetRegionId(buf);
-    Log_info("PostRecvBuffer: rq_idx=%u, buf=%p, lkey=%u, len=%u", rq_idx, buf, sge.lkey, sge.length);
+    sge.lkey = cached_lkey_;  // Use cached lkey (no mutex lock)
+    // Log_info("PostRecvBuffer: rq_idx=%u, buf=%p, lkey=%u, len=%u", rq_idx, buf, sge.lkey, sge.length);
 
     ibv_recv_wr wr = {};
     wr.wr_id = rq_idx;
@@ -786,7 +791,7 @@ ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
     }
     
     size_t size = data.content_size();
-    Log_debug("RdmaEndpoint::SendMessage: sending %zu bytes, window=%d", size, window);
+    // Log_debug("RdmaEndpoint::SendMessage: sending %zu bytes, window=%d", size, window);
     if (size > DEFAULT_BUFFER_SIZE) {
         Log_error("Message too large: %zu > %u", size, DEFAULT_BUFFER_SIZE);
         errno = EMSGSIZE;
@@ -810,7 +815,7 @@ ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
     ibv_sge sge;
     sge.addr = (uint64_t)send_buf;
     sge.length = size;
-    sge.lkey = GetRegionId(send_buf);  // Use block_pool's lkey, not user-registered
+    sge.lkey = cached_lkey_;  // Use cached lkey (no mutex lock)
     
     if (sq_idx == 0) {
         Log_info("SendMessage: first send buf=%p, lkey=%u, size=%zu", send_buf, sge.lkey, size);
@@ -879,8 +884,8 @@ void RdmaEndpoint::HandleCompletions() {
         }
 
         for (int i = 0; i < n; i++) {
-            Log_debug("HandleCompletions: wc[%d] opcode=%d, status=%d, wr_id=%lu, byte_len=%u",
-                      i, wc[i].opcode, wc[i].status, wc[i].wr_id, wc[i].byte_len);
+            // Log_debug("HandleCompletions: wc[%d] opcode=%d, status=%d, wr_id=%lu, byte_len=%u",
+            //           i, wc[i].opcode, wc[i].status, wc[i].wr_id, wc[i].byte_len);
             if (wc[i].status != IBV_WC_SUCCESS) {
                 Log_error("Work completion error: %s",  ibv_wc_status_str(wc[i].status));
                 continue;
@@ -897,7 +902,7 @@ void RdmaEndpoint::HandleCompletions() {
         }
     }
     
-    Log_debug("RdmaEndpoint::HandleCompletions: polled %d valid completions", total);
+    // Log_debug("RdmaEndpoint::HandleCompletions: polled %d valid completions", total);
 }
 
 void RdmaEndpoint::HandleSendCompletion(ibv_wc& wc) {
@@ -913,8 +918,8 @@ void RdmaEndpoint::HandleRecvCompletion(ibv_wc& wc) {
     uint32_t ack_count = ntohl(wc.imm_data);
     uint32_t msg_size = wc.byte_len;
 
-    Log_debug("RdmaEndpoint::HandleRecvCompletion: rq_idx=%u, msg_size=%u, ack_count=%u",
-              rq_idx, msg_size, ack_count);
+    // Log_debug("RdmaEndpoint::HandleRecvCompletion: rq_idx=%u, msg_size=%u, ack_count=%u",
+    //           rq_idx, msg_size, ack_count);
 
     // Process ACKs (sender-side flow control)
     if (ack_count > 0) {
@@ -925,8 +930,8 @@ void RdmaEndpoint::HandleRecvCompletion(ibv_wc& wc) {
     // Append received data to in_buffer
     if (msg_size > 0 && in_buffer_) {
         in_buffer_->write(buf, msg_size);
-        Log_debug("RdmaEndpoint::HandleRecvCompletion: wrote %u bytes, in_buffer_ size now %zu",
-                  msg_size, in_buffer_->content_size());
+        // Log_debug("RdmaEndpoint::HandleRecvCompletion: wrote %u bytes, in_buffer_ size now %zu",
+        //           msg_size, in_buffer_->content_size());
         
         // If callback is set, check if we have a complete packet and process immediately
         if (on_message_callback_) {
@@ -966,7 +971,7 @@ int RdmaEndpoint::SendImm(uint32_t imm) {
         return 0;
     }
     
-    Log_debug("RdmaEndpoint::SendImm: sending pure ACK with %u acks", imm);
+    // Log_debug("RdmaEndpoint::SendImm: sending pure ACK with %u acks", imm);
     
     // Send a message with no data, just immediate data (ACKs)
     ibv_send_wr wr = {};
