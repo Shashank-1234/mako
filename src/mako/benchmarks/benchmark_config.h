@@ -194,6 +194,11 @@ class BenchmarkConfig {
       void setPaxosProcName(std::string paxos_proc_name) { paxos_proc_name_ = paxos_proc_name; setCluster(paxos_proc_name); setClusterRole(mako::convertCluster(paxos_proc_name));}
       void setPaxosConfigFile(const std::vector<std::string>& paxos_config_file) { paxos_config_file_ = paxos_config_file; }
       
+      // Initialize same-DC IPs for RDMA transport selection
+      // Should be called after Paxos config is loaded (in setup() or after Config::GetConfig() is available)
+      // This sets MAKO_LOCAL_DC_IPS environment variable based on datacenter config
+      void initSameDcIPs();
+      
       // Getters and setters for Paxos termination tracking
       int getEndReceived() const { return end_received_.load(); }
       int getEndReceivedLeader() const { return end_received_leader_.load(); }

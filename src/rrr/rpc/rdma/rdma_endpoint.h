@@ -186,7 +186,6 @@ private:
     static const uint32_t DEFAULT_BUFFER_SIZE = 8192;   // 8KB
     static const uint16_t DEFAULT_SQ_SIZE = 256;
     static const uint16_t DEFAULT_RQ_SIZE = 256;
-    static const uint16_t ACK_THRESHOLD = 16;           // Send ACK every 16 receives
     
     // Disable copy
     RdmaEndpoint(const RdmaEndpoint&) = delete;

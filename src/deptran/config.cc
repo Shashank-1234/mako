@@ -302,6 +302,9 @@ void Config::LoadYML(std::string &filename) {
   if (config["host"]) {
     LoadHostYML(config["host"]);
   }
+  if (config["datacenter"]) {
+    LoadDatacenterYML(config["datacenter"]);
+  }
   if (config["mode"]) {
     LoadModeYML(config["mode"]);
   }
@@ -454,6 +457,65 @@ void Config::LoadHostYML(YAML::Node config) {
         }
     }
   }
+}
+
+void Config::LoadDatacenterYML(YAML::Node config) {
+  // Format:
+  // datacenter:
+  //   Virginia: [localhost, p1]
+  //   California: [p2]
+  //   London: [learner]
+  Log_info("Loading datacenter configuration...");
+  
+  for (auto it = config.begin(); it != config.end(); it++) {
+    auto dc_name = it->first.as<string>();
+    auto procs = it->second;
+    
+    Log_info("  Datacenter '%s':", dc_name.c_str());
+    
+    for (auto proc_it = procs.begin(); proc_it != procs.end(); proc_it++) {
+      auto proc_name = proc_it->as<string>();
+      proc_dc_map_[proc_name] = dc_name;
+      dc_procs_map_[dc_name].push_back(proc_name);
+      Log_info("    - %s", proc_name.c_str());
+    }
+  }
+}
+
+std::vector<std::string> Config::GetSameDcIPs(const std::string& proc_name) const {
+  std::vector<std::string> same_dc_ips;
+  
+  // Find which DC this process belongs to
+  auto dc_it = proc_dc_map_.find(proc_name);
+  if (dc_it == proc_dc_map_.end()) {
+    Log_debug("Process '%s' not found in datacenter config", proc_name.c_str());
+    return same_dc_ips;
+  }
+  
+  const std::string& my_dc = dc_it->second;
+  Log_info("Process '%s' is in datacenter '%s'", proc_name.c_str(), my_dc.c_str());
+  
+  // Find all other processes in the same DC
+  auto procs_it = dc_procs_map_.find(my_dc);
+  if (procs_it == dc_procs_map_.end()) {
+    return same_dc_ips;
+  }
+  
+  for (const auto& other_proc : procs_it->second) {
+    // Skip self
+    if (other_proc == proc_name) {
+      continue;
+    }
+    
+    // Look up the IP for this process
+    auto host_it = proc_host_map_.find(other_proc);
+    if (host_it != proc_host_map_.end()) {
+      same_dc_ips.push_back(host_it->second);
+      Log_info("  Same-DC peer: %s -> %s", other_proc.c_str(), host_it->second.c_str());
+    }
+  }
+  
+  return same_dc_ips;
 }
 
 void Config::InitMode(string &cc_name, string& ab_name) {

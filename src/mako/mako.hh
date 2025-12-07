@@ -780,6 +780,9 @@ static abstract_db * init_env() {
       return db;
     }
 
+    // Initialize same-DC IPs for RDMA transport selection (after config is loaded)
+    benchConfig.initSameDcIPs();
+
     // Setup Paxos callbacks have to be after setup() is called
     setup_paxos_leader_callbacks(benchConfig.getAdvanceWatermarkTracker());
     setup_paxos_follower_callbacks(replicated_db);

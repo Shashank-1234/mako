@@ -503,7 +503,6 @@ void ServerListener::handle_read() {
 
     char client_ip_buf[INET6_ADDRSTRLEN];
     const char* client_ip = "unknown";
-    bool is_local = false;
 
     if (clnt_socket >= 0) {
       if (client_addr.ss_family == AF_INET) {
@@ -515,23 +514,21 @@ void ServerListener::handle_read() {
         inet_ntop(AF_INET6, &(addr_in6->sin6_addr), client_ip_buf, sizeof(client_ip_buf));
         client_ip = client_ip_buf;
       }
-      is_local = IsLocalIP(client_ip);
     }
 #endif
     if (clnt_socket >= 0) {
       Log_debug("server@%s got new client from %s, fd=%d", this->addr_.c_str(), client_ip, clnt_socket);
       verify(set_nonblocking(clnt_socket, true) == 0);
 
-      // Create appropriate connection type:
-      // - Local connections (same machine): use TCP (ServerConnection)
-      // - Remote connections: use configured transport (RDMA if enabled)
+      // Create appropriate connection type using ShouldUseRdma():
+      // - Same-DC connections (MAKO_LOCAL_DC_IPS): use RDMA if configured
+      // - All other connections (local, cross-DC, no DC config): use TCP
       rusty::Arc<ServerConnection> sconn = [&]() {
-        auto transport = GetReplicationTransport();
-        if (!is_local && transport == ReplicationTransport::RDMA) {
-          Log_info("Creating RdmaServerConnection for remote client %s (fd=%d)", client_ip, clnt_socket);
+        if (ShouldUseRdma(client_ip)) {
+          Log_info("Creating RdmaServerConnection for same-DC client %s (fd=%d)", client_ip, clnt_socket);
           return rusty::Arc<ServerConnection>(rusty::Arc<RdmaServerConnection>::make(server_, clnt_socket));
         } 
-        Log_info("Creating TCP ServerConnection for client %s (fd=%d) - using TCP for local", client_ip, clnt_socket);
+        Log_info("Creating TCP ServerConnection for client %s (fd=%d)", client_ip, clnt_socket);
         return rusty::Arc<ServerConnection>::make(server_, clnt_socket);
       }();
 

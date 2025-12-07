@@ -816,11 +816,7 @@ ssize_t RdmaEndpoint::SendMessage(Marshal& data) {
     sge.addr = (uint64_t)send_buf;
     sge.length = size;
     sge.lkey = cached_lkey_;  // Use cached lkey (no mutex lock)
-    
-    if (sq_idx == 0) {
-        Log_info("SendMessage: first send buf=%p, lkey=%u, size=%zu", send_buf, sge.lkey, size);
-    }
-    
+
     // Prepare send WR
     ibv_send_wr wr = {};
     wr.wr_id = sq_idx;

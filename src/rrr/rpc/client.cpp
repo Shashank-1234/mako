@@ -293,22 +293,18 @@ int Client::connect(const char* addr) const {
   }
   string host = addr_str.substr(0, idx);
 
-  // Determine transport based on whether target is local or remote
-  bool is_local = rrr::IsLocalIP(host.c_str());
-  auto configured_transport = rrr::GetReplicationTransport();
-
-  if (is_local || configured_transport == rrr::ReplicationTransport::TCP) {
-    // Use TCP for local connections or if TCP is configured
-    transport_ = rrr::ReplicationTransport::TCP;
-    if (is_local && configured_transport == rrr::ReplicationTransport::RDMA) {
-      Log_info("rrr::Client: Using TCP for local connection to %s (RDMA configured but local)", host.c_str());
-    }
-    return TcpConnect(addr);
-  } else {
-    // Use RDMA for remote connections when RDMA is configured
+  // Use ShouldUseRdma() which considers:
+  // - MAKO_REPLICATION_TRANSPORT set to rdma
+  // - Same-DC IPs (MAKO_LOCAL_DC_IPS) -> RDMA
+  // - All other (local, cross-DC, no DC config) -> TCP
+  if (rrr::ShouldUseRdma(host.c_str())) {
     transport_ = rrr::ReplicationTransport::RDMA;
-    Log_info("rrr::Client: Using RDMA for remote connection to %s", host.c_str());
+    Log_info("rrr::Client: Using RDMA for same-DC connection to %s", host.c_str());
     return RdmaConnect(addr);
+  } else {
+    transport_ = rrr::ReplicationTransport::TCP;
+    Log_info("rrr::Client: Using TCP for connection to %s", host.c_str());
+    return TcpConnect(addr);
   }
 }
 

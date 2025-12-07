@@ -132,6 +132,12 @@ class Config {
   vector<SiteInfo> par_clients_;
   map<string, string> proc_host_map_;
   map<string, string> site_proc_map_;
+  
+  // Datacenter configuration: maps process_name -> datacenter_name
+  // Used to determine which nodes are in the same DC for RDMA eligibility
+  map<string, string> proc_dc_map_;
+  // Maps datacenter_name -> list of process_names in that DC
+  map<string, vector<string>> dc_procs_map_;
 
   Sharding* sharding_;
 
@@ -167,6 +173,7 @@ class Config {
   void LoadSiteYML(YAML::Node config);
   void LoadProcYML(YAML::Node config);
   void LoadHostYML(YAML::Node config);
+  void LoadDatacenterYML(YAML::Node config);
   void LoadModeYML(YAML::Node config);
   void LoadBenchYML(YAML::Node config);
   void LoadShardingYML(YAML::Node config);
@@ -174,6 +181,9 @@ class Config {
   void LoadSchemaYML(YAML::Node config);
   void LoadSchemaTableColumnYML(Sharding::tb_info_t &tb_info,
                                 YAML::Node column);
+  
+  // Get same-DC IPs for a given process name (excluding self)
+  std::vector<std::string> GetSameDcIPs(const std::string& proc_name) const;
 
 
   void InitMode(std::string&cc_name, string&ab_name);
