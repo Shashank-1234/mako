@@ -1,198 +1,322 @@
-# RRR RDMA Support
+# Native RDMA Support for RRR Framework
 
-Native RDMA support for RRR RPC layer.
+This document describes the native RDMA support added to the mako RRR framework, enabling high-performance intra-datacenter communication while maintaining TCP for cross-datacenter replication.
 
-## Directory Structure
+## Table of Contents
+
+1. [RDMA Cloud Solutions Across WAN](#1-rdma-cloud-solutions-across-wan)
+2. [Rationale Behind Hybrid Architecture](#2-rationale-behind-hybrid-architecture)
+3. [Why Alibaba eRDMA](#3-why-alibaba-erdma)
+4. [Why Two-Sided RDMA](#4-why-two-sided-rdma)
+5. [Architecture Changes](#5-architecture-changes)
+6. [Performance Numbers](#6-performance-numbers)
+7. [Future Work](#7-future-work)
+
+---
+
+## 1. RDMA Cloud Solutions Across WAN
+
+Here's the current state of cloud vendor support:
+
+| Provider | Technology | WAN Support | Notes |
+|----------|------------|-------------|-------|
+| **Azure** | RoCEv2 | ❌ Limited | Requires lossless fabric with PFC; doesn't scale in WAN. No documentation for cross-region support and cross VNET support |
+| **AWS** | EFA | ⚠️ Partial | Recently added [cross-subnet support](https://aws.amazon.com/about-aws/whats-new/2024/07/elastic-fabric-adapter-cross-subnet-communication/) (July 2024). Unclear if it works across VPCs. |
+| **Google** | Falcon | ❌ Not ready | No working reference implementations available. |
+| **Alibaba** | eRDMA | ⚠️ Partial | Claims cross-VPC support across availability zones. Performance for cross-VPC not well documented. |
+
+**Conclusion**: RDMA over WAN is a fundamentally hard problem.  No cloud vendor provides complete, reliable RDMA over WAN support that would give us confidence to fully migrate the replication layer away from TCP.
+
+---
+
+## 2. Rationale Behind Hybrid Architecture
+
+Since there are no reliable solutions for RDMA over WAN, we implemented a **hybrid architecture**:
+
+- **Intra-DC (Same Datacenter)**: Use RDMA for low-latency, high-throughput communication
+- **Cross-DC (Different Datacenters)**: Use TCP for reliable WAN communication
+
+This approach achieves the best of both worlds:
+- **Performance**: RDMA provides ~76% higher throughput within a datacenter
+- **Reliability**: TCP handles the inherent challenges of WAN communication
+- **Flexibility**: The architecture can easily switch to full RDMA when cloud vendors mature
+
+The recent trends from AWS and Alibaba show a clear push towards RDMA over WAN, so we designed the architecture to be flexible and Connections can easily switch between RDMA and TCP based on the environment variables.
+
+---
+
+## 3. Why Alibaba eRDMA
+
+We chose Alibaba Cloud's eRDMA for the following reasons:
+
+| Feature | Alibaba eRDMA | AWS EFA | Azure RoCEv2 |
+|---------|---------------|---------|--------------|
+| Cross-VPC Support | ✅ Claimed | ✅ Claimed ([AWS EFA Cross-Subnet Announcement](https://aws.amazon.com/about-aws/whats-new/2024/07/elastic-fabric-adapter-cross-subnet-communication/)) | ❌ No |
+| Native Verbs API | ✅ Yes | ❌ Custom libfabric | ✅ Yes |
+| PFC-free Congestion Control | ✅ HPCC | ✅ Custom protocol | ❌ Requires PFC |
+| Reference Implementations that use RDMA | ✅ bRPC | ⚠️ Limited | ✅ eRPC |
+| Cost | ✅ Cheapest | $$$ | $$$ |
+
+### Key Technical Advantages
+
+**High Precision Congestion Control (HPCC)**: Unlike traditional RoCEv2 which requires Priority Flow Control (PFC) for lossless networks, eRDMA uses In-Network Telemetry (INT) and HPCC for congestion control. This makes cloud deployment significantly easier. It also uses DDP (Direct Data Placement) which utilizes full bandwidth of the network
+
+**References**:
+- [HPCC Paper](https://liyuliang001.github.io/publications/hpcc.pdf)
+- [eRDMA Paper](https://www.semanticscholar.org/paper/An-efficient-cloud-based-elastic-RDMA-protocol-for-Cao-Xu/f859617475dd0493609ae005e4a43b7db2868591)
+- [bRPC](https://github.com/apache/brpc/tree/release-1.15)
+
+---
+
+## 4. Why Two-Sided RDMA
+
+We chose **two-sided RDMA** (Send/Receive) over one-sided RDMA (Read/Write) for the following reasons:
+
+| Aspect | Two-Sided RDMA | One-Sided RDMA |
+|--------|----------------|----------------|
+| **Complexity** | Reasonable | Very high. Requires algorithm redesign |
+| **Paxos Changes** | None required | Would need significant changes |
+| **Integration Effort** | Days | Months |
+| **CPU Involvement** | Receiver CPU notified | Receiver CPU bypassed |
+
+One-sided RDMA would require fundamental changes to the Paxos algorithm involvement. Two-sided RDMA behaves like TCP (send/receive semantics), making it a drop-in replacement at the transport layer.
+
+**Key Principle**: Upstream components (Paxos, Raft, rpcbench, etc.) need not care about the underlying transport with Two-sided RDMA
+
+---
+
+## 5. Architecture Changes
+
+### 5.1 Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MAKO_REPLICATION_TRANSPORT` | Transport type: `tcp` or `rdma` | `rdma` |
+| `MAKO_LOCAL_DC_IPS` | Comma-separated IPs of same-DC peers | `10.1.0.14,10.1.0.16` |
+
+**Transport Selection Logic**:
+```
+if MAKO_REPLICATION_TRANSPORT == "rdma" AND target_ip IN MAKO_LOCAL_DC_IPS:
+    use RDMA
+else:
+    use TCP
+```
+
+For Paxos deployments, `MAKO_LOCAL_DC_IPS` is automatically set based on the `datacenter` section in the YAML config file.
+
+### 5.2 YAML Configuration (Optional)
+
+```yaml
+# config/1c1s3r3p-dc.yml
+datacenter:
+  Virginia: [localhost, p2]    # Leader and first follower
+  California: [p3]             # Second follower (cross-DC, uses TCP)
+```
+
+### 5.3 Directory Structure
 
 ```
 src/rrr/rpc/rdma/
-├── rdma_helper.h/cpp      # Global RDMA initialization, device management
-├── block_pool.h/cpp       # Memory registration pool (pre-registered buffers)
-├── rdma_endpoint.h/cpp    # Core RDMA endpoint (QP, CQ, flow control)
-└── README.md              # This file
+├── rdma_helper.h/cpp           # Global RDMA initialization, device management
+├── block_pool.h/cpp            # Pre-registered memory pool
+├── rdma_endpoint.h/cpp         # Core RDMA endpoint (QP, CQ, flow control)
+├── rdma_server_connection.h/cpp # Server-side RDMA connection wrapper
+└── README.md                   # This file
 ```
 
-## Components
+### 5.4 Key Components
 
-### 1. rdma_helper (✅ Implemented)
+#### rdma_helper
+- `GlobalRdmaInitializeOrDie()` - Initialize RDMA subsystem at startup
+- `RegisterMemoryForRdma()` - Register memory regions with NIC
+- `GetGlobalPd()` - Get protection domain for QP creation
 
-**Purpose**: Global RDMA initialization and device management
-
-**Key Functions**:
-- `GlobalRdmaInitializeOrDie()` - Initialize RDMA subsystem (call at startup)
-- `RegisterMemoryForRdma()` - Register user memory for RDMA
-- `GetMemoryLKey()` - Get lkey for registered memory
-- `GetRdmaDeviceInfo()` - Query device capabilities (LID, GID, etc.)
-
-**Usage**:
-```cpp
-#include "rrr/rpc/rdma/rdma_helper.h"
-
-// At startup
-rrr::rdma::GlobalRdmaInitializeOrDie();
-
-// Check availability
-if (rrr::rdma::IsRdmaAvailable()) {
-    // Use RDMA
-}
-```
-
-### 2. block_pool (✅ Implemented)
-
-**Purpose**: Pre-registered memory pool for zero-copy RDMA
-
-**Key Features**:
-- Pre-allocates 1GB registered memory at initialization
-- Extends automatically if pool exhausted (up to 16 regions)
-- Block sizes: 4KB, 16KB, 128KB (configurable)
+#### block_pool
+- Pre-allocates registered memory for RDMA operations
 - Thread-safe allocation/deallocation
+- Avoids per-message memory registration overhead
 
-**Usage**:
-```cpp
-#include "rrr/rpc/rdma/block_pool.h"
+#### rdma_endpoint
+- **Queue Pair (QP)**: One per connection, handles send/receive
+- **Completion Queue (CQ)**: Notifies when operations complete
+- **Flow Control**: Sliding window algorithm (derived from bRPC)
+- **Handshake**: TCP-based capability exchange before RDMA data transfer
 
-// Initialize with registration callback
-rrr::rdma::InitBlockPool(rrr::rdma::RegisterMemoryForRdma);
+### 5.5 Connection Flow
 
-// Allocate registered memory
-void* buf = rrr::rdma::AllocBlock(4096);  // 4KB block
-uint32_t lkey = rrr::rdma::GetRegionId(buf);  // Get lkey
-
-// Use for RDMA...
-
-// Deallocate
-rrr::rdma::DeallocBlock(buf);
+```
+Client                                Server
+   |                                     |
+   |-------- TCP Connect --------------->|
+   |                                     |
+   |<------- TCP Accept -----------------|
+   |                                     |
+   |-------- HelloMessage (RDMA caps) -->|  (over TCP)
+   |                                     |
+   |<------- HelloMessage (RDMA caps) ---|  (over TCP)
+   |                                     |
+   |======== RDMA Send =================>|  (QP now active)
+   |<======= RDMA Receive ===============| 
 ```
 
-### 3. rdma_endpoint (⚠️ ~85% Implemented)
+### 5.6 Key Design Decisions
 
-**Purpose**: RDMA connection endpoint with QP, CQ, and flow control
+1. **CQ integrated with epoll**: Completion channel FD is added to the existing epoll loop
+2. **Async Send/Receive**: RdmaEndpoint class handles RDMA operations directly, not the epoll thread to send and recv work requests
+3. **Flow Control**: Sliding window with piggybacked ACKs in immediate data
+4. **Memory Management**: Single copy from Marshal to registered RDMA buffers
+5. **Completion Notifications**: Used to track and release registered memory, send Acks and call RPC callbacks
 
-**Implemented**:
-- ✅ Resource allocation (QP, CQ, buffers)
-- ✅ QP state transitions (RESET → INIT → RTR → RTS)
-- ✅ **TCP handshake (HelloMessage protocol)**
-- ✅ `ConnectTo` (client-side handshake)
-- ✅ `AcceptFrom` (server-side handshake)
-- ✅ Send with flow control (`Write`)
-- ✅ Completion handling (`HandleCompletionEvents`)
-- ✅ Flow control (sliding window + ACK piggybacking)
-- ✅ Epoll integration (completion channel FD)
+### 5.7 Modified Files
 
-**TODO**:
-- ❌ Receive queue management (`Read`)
-- ❌ Message deserialization
-- ❌ Error handling and reconnection
+| File | Changes |
+|------|---------|
+| `src/rrr/rpc/transport_config.h` | Added `MAKO_LOCAL_DC_IPS` support, `ShouldUseRdma()` |
+| `src/rrr/rpc/client.cpp` | Transport selection based on `ShouldUseRdma()` |
+| `src/rrr/rpc/server.cpp` | Accept creates `RdmaServerConnection` or `ServerConnection` |
+| `src/deptran/config.cc` | Parse `datacenter` YAML section |
+| `src/mako/benchmarks/benchmark_config.cpp` | `initSameDcIPs()` sets env var from config |
 
-**Design**:
-```cpp
-// Client side
-RdmaEndpoint ep;
-ep.Initialize();
-ep.ConnectTo("10.0.0.1", 9000);  // TODO: Implement
+---
 
-// Send
-std::shared_ptr<Marshallable> msg = ...;
-ssize_t sent = ep.Write(msg);
+## 6. Performance Numbers
 
-// Receive (in event loop)
-int fd = ep.GetCompletionFd();
-// epoll_wait on fd...
-ep.HandleCompletionEvents();
+Benchmarks using `rpcbench` with 1KB messages.
+
+### Test Topology
+
+| Node | IP | Location |
+|------|-----|----------|
+| Server | 10.1.0.14 | Virginia DC |
+| Client 1 | 10.1.0.16 | Virginia DC (same-VPC) |
+| Client 2 | 10.2.0.124 | California DC (cross-DC, different VPC) |
+
+### Same-DC: RDMA vs TCP
+
+| Transport | Improvement |
+|-----------|-------------|
+| **RDMA** |  **+50-75%** |
+| TCP | baseline |
+
+**RDMA (Same-DC)**:
+```bash
+# Server
+ecs-user@mako-eRDMA002:~/mako$ MAKO_LOCAL_DC_IPS=10.1.0.16 MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -s 0.0.0.0:8848
+
+# Client
+ecs-user@iZ0xi1p2dkpx2m5pmkxurhZ:~/mako$ MAKO_LOCAL_DC_IPS=10.1.0.14 MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -c 10.1.0.14:8848 -w 1 -t 1 | grep qps
+qps: 165887
+qps: 161284
+qps: 177089
+qps: 176058
+qps: 176796
+qps: 161142
+qps: 175449
+qps: 161250
+avg qps: 169369.38
 ```
 
-## Memory Management with RustyCpp
+**TCP (Same-DC)**:
+```bash
+# Server
+ecs-user@mako-eRDMA002:~/mako$ MAKO_REPLICATION_TRANSPORT=tcp ./build/rpcbench -s 0.0.0.0:8848
 
-All memory management follows RRR's RustyCpp patterns:
-
-```cpp
-// ✅ CORRECT: Use smart pointers
-class RdmaEndpoint {
-    std::vector<void*> send_buffers_;                    // Raw RDMA buffers (OK)
-    std::vector<std::shared_ptr<Marshallable>> sbuf_;    // Smart pointers for objects
-};
-
-ssize_t Write(std::shared_ptr<Marshallable> data) {
-    sbuf_[sq_current_] = data;  // Keep alive until send completion
-    // ...
-    ibv_post_send(...);
-}
-
-void HandleSendCompletion(ibv_wc& wc) {
-    sbuf_[sq_idx].reset();  // Release → auto-deallocates if last reference
-}
+# Client
+ecs-user@iZ0xi1p2dkpx2m5pmkxurhZ:~/mako$ MAKO_REPLICATION_TRANSPORT=tcp ./build/rpcbench -c 10.1.0.14:8848 -w 1 -t 1 | grep qps
+qps: 95998
+qps: 96370
+qps: 96088
+qps: 96700
+qps: 96626
+qps: 95942
+qps: 95945
+qps: 97115
+avg qps: 96348.00
 ```
 
-## Build Configuration
+### Hybrid Mode: Simultaneous RDMA + TCP Clients
 
-```cmake
-# CMakeLists.txt
-option(RDMA_REPLICATION "Enable RDMA support in RRR" OFF)
+Demonstrates that RRR Server can handle both transports concurrently:
 
-if(RDMA_REPLICATION)
-    add_definitions(-DRDMA_REPLICATION)
-    find_package(Verbs REQUIRED)
-    
-    # Add RDMA sources
-    set(RRR_RDMA_SOURCES
-        src/rrr/rpc/rdma/rdma_helper.cpp
-        src/rrr/rpc/rdma/block_pool.cpp
-        src/rrr/rpc/rdma/rdma_endpoint.cpp
-    )
-    
-    target_sources(rrr PRIVATE ${RRR_RDMA_SOURCES})
-    target_link_libraries(rrr ibverbs)
-endif()
+```bash
+# Server (Virginia)
+ecs-user@mako-eRDMA002:~/mako$ MAKO_LOCAL_DC_IPS=10.1.0.16 MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -s 0.0.0.0:8848
+D [/home/ecs-user/mako/src/rrr/rpc/server.cpp:522] 2025-12-07 16:19:49.312 | server@0.0.0.0:8848 got new client from 10.1.0.16, fd=7
+I [/home/ecs-user/mako/src/rrr/rpc/transport_config.h:181] 2025-12-07 16:19:49.312 | [RRR] Same-DC IPs (MAKO_LOCAL_DC_IPS):
+I [/home/ecs-user/mako/src/rrr/rpc/transport_config.h:183] 2025-12-07 16:19:49.312 | [RRR]   - 10.1.0.16
+I [/home/ecs-user/mako/src/rrr/rpc/server.cpp:531] 2025-12-07 16:19:49.312 | Creating RdmaServerConnection for same-DC client 10.1.0.16 (fd=7)
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_server_connection.cpp:15] 2025-12-07 16:19:49.312 | RdmaServerConnection: created with ctrl_socket=7 (handshake pending)
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:91] 2025-12-07 16:19:49.312 | RdmaEndpoint: initialized (SERVER, resources deferred)
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_server_connection.cpp:40] 2025-12-07 16:19:49.312 | RdmaServerConnection: starting handshake thread for fd=7
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_server_connection.cpp:76] 2025-12-07 16:19:49.312 | RdmaServerConnection: Handshake thread started for fd=7
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:720] 2025-12-07 16:19:49.312 | RdmaEndpoint::AcceptFrom: accepting RDMA connection on fd=7
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:579] 2025-12-07 16:19:49.312 | Starting server handshake (60s timeout)
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:587] 2025-12-07 16:19:49.312 | Waiting for client HelloMessage...
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:606] 2025-12-07 16:19:49.312 | Received HelloMessage: remote_qp=1005, sq=256, rq=256
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:611] 2025-12-07 16:19:49.312 | Server: allocating RDMA resources after HelloMessage
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:189] 2025-12-07 16:19:49.312 | RdmaEndpoint: cached lkey=64000
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:191] 2025-12-07 16:19:49.312 | RdmaEndpoint: allocated QP num=1872, SQ=256, RQ=256
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:193] 2025-12-07 16:19:49.312 | RdmaEndpoint: CQ=0x7f29bde01000, QP=0x7f29bde16000, comp_channel fd=8
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:656] 2025-12-07 16:19:49.312 | Sending HelloMessage: qp_num=1872, sq=256, rq=256
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_endpoint.cpp:680] 2025-12-07 16:19:49.413 | Server handshake complete (took 100 ms)
+I [/home/ecs-user/mako/src/rrr/rpc/rdma/rdma_server_connection.cpp:95] 2025-12-07 16:19:49.413 | RdmaServerConnection: Adding to poll with RDMA FD
+
+D [/home/ecs-user/mako/src/rrr/rpc/server.cpp:522] 2025-12-07 16:19:51.317 | server@0.0.0.0:8848 got new client from 10.2.0.124, fd=9
+I [/home/ecs-user/mako/src/rrr/rpc/server.cpp:537] 2025-12-07 16:19:51.317 | Creating TCP ServerConnection for cross-DC client 10.2.0.124 (fd=9)
+
+# Client 1 (Virginia - uses RDMA)
+ecs-user@iZ0xi1p2dkpx2m5pmkxurhZ:~/mako$ MAKO_LOCAL_DC_IPS=10.1.0.14 MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -c 10.1.0.14:8848 -w 1 -t 1 | grep qps
+qps: 177697
+qps: 143078
+qps: 122113
+qps: 157061
+qps: 174086
+qps: 151447
+qps: 164030
+qps: 168605
+avg qps: 157264.62
+
+# Client 2 (California - uses TCP, no MAKO_LOCAL_DC_IPS set)
+ecs-user@mako-eRDMA-California:~/mako$ ./build/rpcbench -c 10.1.0.14:8848 -w 1 -t 1 | grep qps
+qps: 12000
+qps: 12210
+qps: 12053
+qps: 13000
+qps: 12131
+qps: 12420
+qps: 12580
+qps: 12000
+avg qps: 12299.25  # Limited by WAN latency (~80ms RTT)
 ```
 
-## Testing
+---
+
+## 7. Future Work
+
+### a) Memory Optimization
+Currently, we copy data from `Marshal` to registered RDMA buffers. This decouples the write path to allow `Marshal` reuse. Future optimization to use Marshall directly with RDMA buffers.
+
+### b) Flow Control Tuning
+Optimize send/receive queue sizes and flow control parameters based on real-world Paxos workloads.
+
+### c) Full WAN RDMA
+When cloud vendors provide reliable RDMA over WAN, the architecture can easily switch by simply adding cross-DC IPs to `MAKO_LOCAL_DC_IPS`.
+
+### d) Error Handling
+Implement automatic fallback to TCP on RDMA connection failures.
+
+---
+
+## Quick Start
 
 ```bash
 # Build with RDMA support
 cmake -DRDMA_REPLICATION=ON ..
 make -j32
 
-# Test basic initialization
-./test_rdma_init
+# Run server (RDMA enabled for same-DC clients)
+MAKO_LOCAL_DC_IPS=<client_ip> MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -s 0.0.0.0:8848
 
-# Test connection (TODO)
-./test_rdma_connection
+# Run client (RDMA to same-DC server)
+MAKO_LOCAL_DC_IPS=<server_ip> MAKO_REPLICATION_TRANSPORT=rdma ./build/rpcbench -c <server_ip>:8848 -w 1 -t 1
 ```
-
-## Next Steps
-
-### Phase 1: ~~Complete Handshake~~ ✅ **DONE**
-1. ~~Implement `DoClientHandshake`~~ ✅ Implemented
-2. ~~Implement `DoServerHandshake`~~ ✅ Implemented  
-3. ~~Handshake protocol~~ ✅ MAGIC "RDMA" + HelloMessage
-
-### Phase 2: Receive Path (Priority: HIGH - NEXT)
-1. Implement receive queue management
-2. Deserialize from recv buffers to Marshallable
-3. Implement `Read()` method
-
-### Phase 3: Integration with Client/Server (Priority: MEDIUM)
-1. Create `Endpoint` base class (abstraction)
-2. Implement `TcpEndpoint` (existing socket code)
-3. Implement `RdmaEndpoint` deriving from `Endpoint`
-4. Update `Client`/`Server` to use `Endpoint*` polymorphically
-
-### Phase 4: Testing & Hardening (Priority: MEDIUM)
-1. Unit tests for handshake, send/recv, flow control
-2. Integration tests with RRR RPC
-3. Error handling, reconnection, fallback to TCP
-4. Performance benchmarks
-
-## References
-
-- Design doc: `/home/ecs-user/mako-rdma/docs/README.migration.md`
-- RRR docs: `/home/ecs-user/mako/doc/`
-
-## Key Design Principles
-
-1. **Memory must be pre-registered** - Use block_pool for all RDMA buffers
-2. **Flow control is explicit** - Track window_size, send ACKs
-3. **Repost receives immediately** - Or receive queue exhausts
-4. **Handshake over TCP** - RDMA for data, TCP for connection setup
-5. **One lkey per region** - Not per allocation (efficient!)
-6. **Use memcpy for now** - Can optimize to zero-copy scatter-gather later
