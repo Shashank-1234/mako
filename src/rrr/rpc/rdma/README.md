@@ -291,6 +291,91 @@ avg qps: 12299.25  # Limited by WAN latency (~80ms RTT)
 
 ---
 
+## TPC-C Replication Metrics (Mako `dbtest`)
+
+Benchmarks conducted with **1 shard** and **4 replicas**  
+Deployment: Leader + P2 on VM1, P1 + Learner on VM2
+
+---
+
+### TCP Baseline (Same Datacenter)
+
+**Topology**
+- **VM1**: Leader, P2  
+- **VM2**: P1, Learner  
+
+#### Replication Metrics
+
+| Metric | Value |
+|------|------|
+| Memory Delta | 3631.47 MB |
+| Commits | 804,082 |
+| Memory Delta Rate | 56.86 MB/s |
+| Logical Memory Delta | 50.94 MB |
+| Logical Delta Rate | 0.80 MB/s |
+| Throughput | 12,589 ops/s |
+| Avg Throughput / Core | 12,589 ops/s |
+| Persist Throughput | 12,589 ops/s |
+| Avg Latency | 0.077 ms |
+| Abort Rate | 0 aborts/s |
+
+#### Transaction Latencies (Local)
+
+| Transaction | Commit Latency |
+|------------|----------------|
+| NewOrder | 0.090 ms |
+| Payment | 0.052 ms |
+| Delivery | 0.245 ms |
+| OrderStatus | 0.036 ms |
+| StockLevel | 0.100 ms |
+
+---
+
+### RDMA (Same Datacenter)
+
+**Topology**
+- **VM1**: Leader, P2  
+- **VM2**: P1, Learner  
+
+#### Replication Metrics
+
+| Metric | Value |
+|------|------|
+| Runtime | 41.42 sec |
+| Memory Delta | 3474.61 MB |
+| Commits | 1,639,160 |
+| Memory Delta Rate | 83.88 MB/s |
+| Logical Memory Delta | 103.85 MB |
+| Logical Delta Rate | 2.51 MB/s |
+| Throughput | 39,571 ops/s |
+| Avg Throughput / Core | 39,571 ops/s |
+| Persist Throughput | 39,571 ops/s |
+| Avg Latency | 0.022 ms |
+| Abort Rate | 0 aborts/s |
+
+#### Transaction Latencies (Local)
+
+| Transaction | Commit Latency |
+|------------|----------------|
+| NewOrder | 0.020 ms |
+| Payment | 0.019 ms |
+| Delivery | 0.084 ms |
+| OrderStatus | 0.005 ms |
+| StockLevel | 0.063 ms |
+
+---
+
+### Summary Comparison
+
+| Metric | TCP | RDMA | Improvement |
+|------|-----|------|-------------|
+| Throughput | 12,589 ops/s | 39,571 ops/s | **3.14×** |
+| Avg Latency | 0.077 ms | 0.022 ms | **3.5× lower** |
+| Memory Delta Rate | 56.8 MB/s | 83.9 MB/s | **1.47×** |
+| Logical Delta Rate | 0.80 MB/s | 2.51 MB/s | **3.1×** |
+
+---
+
 ## 7. Future Work
 
 ### a) Memory Optimization
